@@ -1,10 +1,8 @@
 # Estágio de Build
-FROM golang:1.24-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 WORKDIR /app
 
-# Permite que o Go baixe automaticamente a versão exata exigida pelo go.mod
-ENV GOTOOLCHAIN=auto
 
 # Copia dependências
 COPY go.mod go.sum ./
