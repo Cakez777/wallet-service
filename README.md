@@ -150,9 +150,22 @@ Autenticação contra o **Keycloak real** (exige `docker compose up -d keycloak`
 go test -tags keycloak -count=1 ./internal/auth/
 ```
 
-> As três "instâncias independentes" dos testes são três `Service` com pools de conexão próprios no mesmo
-> processo. Rodar três processos do binário contra o mesmo banco funciona pelo mesmo mecanismo (estado só no
-> PostgreSQL), mas esse cenário não está automatizado.
+Três **processos do sistema operacional** disputando a mesma carteira (o binário de teste é reexecutado três vezes,
+cada processo com seu pool; largada sincronizada): `TestThreeProcessesRaceTwoBetsOf80On100` (6 apostas simultâneas de 80.00
+sobre 100.00: exatamente 1 processada, saldo 20.00, 1 débito) e `TestThreeProcessesSendTheSameIdempotentBet`
+(60 envios idênticos vindos de 3 processos: 1 débito). Rodam com `-tags integration`.
+
+Mensageria contra um **SQS real** (LocalStack; filas FIFO e DLQ com redrive criadas pelo teste, consumidor e publicador
+reais, sem fila em memória). Exige `docker compose up -d postgres localstack`:
+
+```
+go test -tags localstack -count=1 -v ./internal/inbound/
+```
+
+Cobrem: reentregas e comandos repetidos (a inbox os ignora), duas instâncias na mesma carteira sem saldo negativo e em ordem,
+mensagens inválidas na DLQ, falha antes do commit com retentativa (aplicada uma única vez), redrive para a DLQ após o limite
+de entregas, e publicação da outbox numa fila de eventos real com deduplicação por `eventId`. Os testes com
+`-tags integration` usam uma fila em memória com a mesma semântica para rodar rápido e sem Docker além do PostgreSQL.
 
 ## Estrutura
 

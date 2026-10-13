@@ -202,10 +202,10 @@ são contadas por este serviço; o que o serviço vê é cada `retried`. Diverg�
 ## Interpretações e limitações
 
 - `go.mod` declara `go 1.27.2` (a versão usada no desenvolvimento); o Dockerfile usa `golang:1.27-alpine`.
-- "Três instâncias" nos testes = três `Service` com pools próprios no mesmo processo; três processos não estão automatizados.
+- A corrida entre três **processos do SO** está automatizada (`multiprocess_integration_test.go`); os demais testes de concorrência usam várias instâncias de `Service` com pools próprios no mesmo processo.
 - Contra o Keycloak real há um teste (`-tags keycloak`) e o fluxo do README, mas ambos dependem de subir o compose.
 - O `docker compose` completo (Keycloak com hostname fixo `localhost:8081`, LocalStack) não foi executado no ambiente em que o código foi escrito; lá só rodaram os testes (PostgreSQL real, filas em memória). A execução do compose é verificada na máquina do autor.
-- Os testes de mensageria usam uma fila em memória com a mesma semântica relevante do SQS FIFO (grupo, visibilidade, contagem de entregas, deduplicação, DLQ). O adaptador do SDK da AWS compila, mas só é exercitado contra o LocalStack.
+- Os testes de mensageria usam uma fila em memória com a mesma semântica relevante do SQS FIFO (grupo, visibilidade, contagem de entregas, deduplicação, DLQ). Os testes com `-tags localstack` (`internal/inbound/sqs_localstack_test.go`) exercitam o adaptador do SDK, o consumidor e o publicador contra um SQS real; eles exigem o LocalStack no ar e não foram executados no ambiente em que o código foi escrito (sem Docker).
 - Validação de `aud`, introspecção/revogação de token e rotação de segredos não foram implementadas.
 
 ## Não implementado
@@ -216,5 +216,4 @@ são contadas por este serviço; o que o serviço vê é cada `retried`. Diverg�
 | Validação de `aud`, introspecção/revogação de token | Não implementado |
 | Política IAM do SQS **aplicada** | Documentada; o LocalStack do compose não a aplica |
 | Execução contra a AWS real | Não testada; só LocalStack (e filas em memória nos testes) |
-| Três processos reais contra o mesmo banco/fila | Não automatizado (os testes usam várias instâncias no mesmo processo) |
 | Tracing OpenTelemetry, partidas dobradas, testes de carga | Opcionais; não feitos |

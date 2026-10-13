@@ -140,3 +140,23 @@ func (q *SQS) Ping(ctx context.Context) error {
 		QueueUrl: aws.String(q.url), AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameQueueArn}})
 	return err
 }
+
+// Approximate devolve contagens aproximadas (o SQS é eventualmente consistente): mensagens
+// visíveis, em voo e em atraso. Útil em testes e diagnóstico.
+func (q *SQS) Approximate(ctx context.Context) (visible, inFlight, delayed int, err error) {
+	out, err := q.client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+		QueueUrl: aws.String(q.url),
+		AttributeNames: []types.QueueAttributeName{
+			types.QueueAttributeNameApproximateNumberOfMessages,
+			types.QueueAttributeNameApproximateNumberOfMessagesNotVisible,
+			types.QueueAttributeNameApproximateNumberOfMessagesDelayed,
+		},
+	})
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	visible, _ = strconv.Atoi(out.Attributes[string(types.QueueAttributeNameApproximateNumberOfMessages)])
+	inFlight, _ = strconv.Atoi(out.Attributes[string(types.QueueAttributeNameApproximateNumberOfMessagesNotVisible)])
+	delayed, _ = strconv.Atoi(out.Attributes[string(types.QueueAttributeNameApproximateNumberOfMessagesDelayed)])
+	return visible, inFlight, delayed, nil
+}
