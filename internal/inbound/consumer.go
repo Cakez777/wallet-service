@@ -228,6 +228,11 @@ func (c *Consumer) handle(ctx context.Context, m messaging.Message) bool {
 	if err != nil {
 		return c.deadLetter(ctx, m, fmt.Errorf("%w: %v", errMalformed, err))
 	}
+	if cmd.CorrelationID == "" {
+		// Como no HTTP, toda operação tem um correlationId; sem um do produtor, usa o id da
+		// mensagem SQS. Não entra no hash do payload, então não afeta a idempotência.
+		cmd.CorrelationID = m.ID
+	}
 	messageID := cmd.ProviderID + ":" + cmd.IdempotencyKey
 	hash := cmd.PayloadHash()
 	name := c.cfg.Name

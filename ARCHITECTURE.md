@@ -118,6 +118,7 @@ transação, ledger, saldo e outbox → `completed_at` da inbox → commit. Só 
   `SQS_MAX_RECEIVE` entregas, a **própria fila** move a mensagem para a DLQ.
 - Mensagem inválida (JSON, campos, tipo desconhecido), conflito de idempotência (mesma chave, conteúdo diferente) ou carteira inexistente:
   vai direto para a DLQ, sem gastar retentativas. Rejeições de negócio (saldo insuficiente etc.) **não** são erro: viram transação `REJECTED` e a mensagem é confirmada.
+- `correlationId`: vem do corpo; se faltar, usa-se o id da mensagem SQS (como o HTTP, que gera um quando o cabeçalho não vem).
 - Se uma mensagem de um grupo falha, as seguintes do mesmo grupo no mesmo lote são devolvidas sem processar (preserva a ordem).
 - Encerramento: para de buscar mensagens, conclui a que está em processamento (limite de 30s) e retorna.
 - `SQS_VISIBILITY_SECONDS` (padrão 60) precisa ser maior que esse limite, para a mensagem não reaparecer enquanto é processada.

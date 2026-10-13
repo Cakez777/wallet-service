@@ -386,3 +386,27 @@ func TestEndToEndCommandToPublishedEvents(t *testing.T) {
 		t.Errorf("o correlationId do comando deveria acompanhar os eventos: %v", events.Bodies())
 	}
 }
+
+func TestMissingCorrelationIDFallsBackToMessageID(t *testing.T) {
+	f := newFixture(t, "100.00", 5)
+	m := f.msg("BET", "10.00", 1)
+	m.CorrelationID = "" // o produtor não informou
+	f.publish(m, "")
+	f.start(f.svc, 1)
+	eventually(t, 10*time.Second, "fila esvaziar", func() bool { return f.q.Depth() == 0 })
+
+	var corr string
+	if err := f.db.QueryRow(`SELECT correlation_id FROM wager_transactions WHERE wallet_id=$1 AND kind='BET'`, f.walID).Scan(&corr); err != nil {
+		t.Fatal(err)
+	}
+	if corr == "" {
+		t.Error("correlationId deveria ter um valor de fallback (id da mensagem)")
+	}
+	var inEvents int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM outbox_events WHERE payload->>'correlationId' = $1`, corr).Scan(&inEvents); err != nil {
+		t.Fatal(err)
+	}
+	if inEvents < 1 {
+		t.Errorf("os eventos deveriam carregar o correlationId %q", corr)
+	}
+}
