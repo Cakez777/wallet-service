@@ -37,7 +37,7 @@ consulta de duplicata → decisão → linha de `wager_transactions` → lançam
 
 - Persistente: índices únicos parciais em `(provider_id, idempotency_key)` e `(provider_id, external_transaction_id)`.
   Sobrevive a reinícios e funciona entre instâncias.
-- `Idempotency-Key` é obrigatório (HTTP); no SQS será `data.idempotencyKey`. O servidor nunca substitui a chave.
+- `Idempotency-Key` é obrigatório (HTTP); no SQS é o campo `idempotencyKey` do corpo. O servidor nunca substitui a chave.
 - **Hash do payload**: SHA-256 (hex) do JSON canônico (chaves ordenadas) de `providerId, externalTransactionId, playerId,
   walletId, roundId, gameId, kind, money{amount,currency}, referenceExternalTransactionId` (`""` se ausente). Fora do hash:
   `idempotencyKey`, `correlationId` e metadados de transporte. HTTP e SQS montam o mesmo `Command`, logo o mesmo hash.
@@ -88,10 +88,57 @@ Pendências sobrevivem a reinícios (estado no banco).
 - `wallet_ledger_entries`: direção, valor, saldo antes/depois, `CHECK` da aritmética, `UNIQUE (wallet_id, transaction_id)`,
   triggers que bloqueiam `UPDATE`/`DELETE`/`TRUNCATE`. `LOSS` e rejeições não geram lançamento. Paginação por cursor opaco (`seq`).
 - `outbox_events`: o evento é gravado **na mesma transação** do estado, do saldo e do ledger (envelope com `eventId`,
-  `eventType`, `aggregateId`, `correlationId`, `causationId`, `occurredAt` UTC RFC 3339, `version`, `data`). Colunas de retry,
-  backoff e lock de publicador já existem. A abertura de carteira com saldo > 0 cria `OPENING` + crédito + eventos no mesmo commit.
-- `inbox_messages` (`PRIMARY KEY (consumer_name, message_id)`) existe no schema.
-- **Falta** (veja "Não implementado"): o publicador da outbox e o consumidor SQS/inbox.
+  `eventType`, `aggregateId`, `correlationId`, `causationId`, `occurredAt` UTC RFC 3339, `version`, `data`). A abertura de carteira
+  com saldo > 0 cria `OPENING` + crédito + eventos no mesmo commit. O publicador está descrito em "Mensageria".
+- `inbox_messages` (`PRIMARY KEY (consumer_name, message_id)`): linha gravada pelo consumidor SQS **na mesma transação** que altera o
+  saldo (veja "Mensageria").
+
+## Mensageria (SQS)
+
+Duas filas FIFO (cada uma com sua DLQ, criadas pelo app na inicialização, com `RedrivePolicy` de `SQS_MAX_RECEIVE` entregas):
+
+| Fila | Sentido | `MessageGroupId` | `MessageDeduplicationId` |
+|---|---|---|---|
+| `wager-transactions.fifo` (+ `-dlq`) | provedores/serviços → este serviço (comandos) | `walletId` | `idempotencyKey` (sugerido ao produtor) |
+| `wallet-events.fifo` (+ `-dlq`) | este serviço → consumidores (eventos) | `aggregateId` | `eventId` |
+
+**Por que FIFO e esses grupos.** O grupo `walletId` faz a fila entregar as mensagens de uma carteira em ordem e nunca em paralelo
+(enquanto uma está em voo, a próxima do grupo espera), mesmo com várias instâncias consumindo; carteiras diferentes andam em paralelo.
+A ordem não é a única proteção: o lock de linha da carteira e a idempotência continuam valendo, então a correção não depende da fila.
+A deduplicação da fila só cobre 5 minutos; a deduplicação **definitiva** é a da inbox e das chaves de idempotência no PostgreSQL.
+
+**Consumidor** (`internal/inbound`). Corpo JSON = o mesmo contrato do HTTP, com a chave no corpo
+(`providerId`, `idempotencyKey`, `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`, `money`,
+`referenceExternalTransactionId`, `correlationId`). Usa o **mesmo** `app.Service.Process` do HTTP (via `ProcessWith`).
+Em uma única transação SQL: `INSERT` na inbox (`consumer_name`, `providerId:idempotencyKey`, hash) → trava da carteira → decisão →
+transação, ledger, saldo e outbox → `completed_at` da inbox → commit. Só depois do commit a mensagem é apagada.
+- Entrega repetida: a inbox acusa a duplicata, nada é reprocessado, a mensagem é apagada (`duplicate`).
+- Queda entre o commit e o delete: a mensagem volta e vira duplicata. Queda antes do commit: tudo é desfeito e a mensagem volta (testado).
+- Falha transitória (banco fora, deadlock): `ChangeMessageVisibility` com backoff exponencial (1s, 2s, 4s… teto 60s). Após
+  `SQS_MAX_RECEIVE` entregas, a **própria fila** move a mensagem para a DLQ.
+- Mensagem inválida (JSON, campos, tipo desconhecido), conflito de idempotência (mesma chave, conteúdo diferente) ou carteira inexistente:
+  vai direto para a DLQ, sem gastar retentativas. Rejeições de negócio (saldo insuficiente etc.) **não** são erro: viram transação `REJECTED` e a mensagem é confirmada.
+- Se uma mensagem de um grupo falha, as seguintes do mesmo grupo no mesmo lote são devolvidas sem processar (preserva a ordem).
+- Encerramento: para de buscar mensagens, conclui a que está em processamento (limite de 30s) e retorna.
+- `SQS_VISIBILITY_SECONDS` (padrão 60) precisa ser maior que esse limite, para a mensagem não reaparecer enquanto é processada.
+
+**Publicador da outbox** (`internal/outbox`). Publica depois do commit, **pelo menos uma vez**.
+- Reivindica lotes com `FOR UPDATE SKIP LOCKED` e uma concessão (`locked_by`, `locked_until`, 30s). Vários publicadores/instâncias
+  nunca pegam o mesmo evento (testado: 4 publicadores, 200 eventos, exatamente 200 envios).
+- Só o evento **mais antigo não publicado de cada agregado** é elegível: a ordem por agregado vale mesmo com vários publicadores
+  (um evento em backoff segura os seguintes do mesmo agregado).
+- Falha ao publicar: `attempts+1`, `last_error`, `next_attempt_at` com backoff exponencial (1s → teto 60s). Fila fora do ar não derruba o serviço;
+  ao voltar, a outbox drena sozinha (testado).
+- Queda do publicador depois de reivindicar: a concessão expira e outro publica. Queda **depois** de enviar e **antes** de marcar:
+  o evento é republicado com o **mesmo `eventId`**, que também é o `MessageDeduplicationId` (a fila descarta repetições nos 5 minutos seguintes;
+  consumidores devem deduplicar por `eventId`).
+- Eventos: `WagerTransactionProcessed`, `WagerTransactionRejected`, `WagerTransactionPendingReference`, `WalletBalanceChanged`.
+
+**Controle de acesso à fila.** A fila de comandos é um canal **confiável**: o serviço aceita o `providerId` que vem na mensagem, sem validar JWT por
+mensagem. Quem pode escrever nela é decidido pelo broker (IAM). Política pretendida na AWS real:
+produtores → `sqs:SendMessage` só em `wager-transactions.fifo`; este serviço → `sqs:ReceiveMessage`, `sqs:DeleteMessage`,
+`sqs:ChangeMessageVisibility`, `sqs:GetQueueAttributes` nela, e `sqs:SendMessage` em `wallet-events.fifo` e nas DLQs; consumidores de eventos → só leitura.
+**No LocalStack do compose essa política não é aplicada** (qualquer credencial funciona): é uma limitação do ambiente local, não uma garantia.
 
 ## Autenticação e autorização
 
@@ -103,19 +150,38 @@ Pendências sobrevivem a reinícios (estado no banco).
 - Matriz: provedor envia e consulta só as próprias transações (o `providerId` do corpo/URL deve ser o do token → senão `403`;
   transação de outro provedor responde `404`, sem revelar existência; vale também para replays). Operações de carteira
   (abrir, consultar, ledger, reconciliar) são só do serviço interno. `/health/*` é público. Acessos negados não têm efeito financeiro (testado).
-- Segredos do realm são de **desenvolvimento**. O controle de acesso à fila SQS (credenciais/políticas do broker) não existe ainda.
+- Segredos do realm são de **desenvolvimento**. O acesso à fila SQS é controlado pelo broker (veja "Mensageria"); no LocalStack não é aplicado.
 
 ## Composição com Uber Fx e shutdown
 
-`bootstrap.Module()`: `LoadConfig` (valida; sem `OIDC_*` a app não sobe) → `newDB` (ping na partida; `Close` na parada) → `Service` →
-verificador de JWT → API → `Invoke(startWorker, startServer)`. Início: falha se o PostgreSQL estiver inalcançável ou a porta ocupada.
-Parada (ordem inversa): o servidor deixa de aceitar conexões e conclui as requisições em andamento (`Shutdown` com prazo); o worker é
-cancelado e **aguardado**; só então o pool do banco fecha. Testado (`bootstrap_integration_test.go`).
+`bootstrap.Module()`: `LoadConfig` (valida; sem `OIDC_*` a app não sobe) → `newDB` (ping na partida; `Close` na parada) → `Service` (com observador de métricas) →
+verificador de JWT → API → `Invoke(startWorker, startMessaging, startServer)`. Início: falha se o PostgreSQL estiver inalcançável, a porta ocupada
+ou o SQS não responder dentro do prazo de partida (30s; o app tenta provisionar as filas de novo a cada 2s). Parada (ordem inversa): o servidor deixa de
+aceitar conexões e conclui as requisições em andamento; o consumidor SQS e o publicador da outbox concluem o que estão fazendo; o worker de pendências é
+cancelado e **aguardado**; só então o pool do banco fecha. `MESSAGING_ENABLED=false` desliga a mensageria (usado nos testes de ciclo de vida do Fx).
 
 ## Observabilidade
 
-Logs JSON (`slog`) com `correlationId` (cabeçalho `X-Correlation-Id` ou gerado, ecoado e persistido), `transactionId`, `walletId`,
-`providerId`; sem credenciais nem payload completo. Health: `live` e `ready` (PostgreSQL). Divergência de reconciliação vai para o log.
+Logs JSON (`slog`) com `correlationId` (cabeçalho `X-Correlation-Id` ou gerado, ecoado e persistido; nas mensagens SQS vem do corpo),
+`transactionId`, `walletId`, `providerId`; sem credenciais nem payload completo. Health: `live` e `ready` (PostgreSQL + as duas filas).
+
+`GET /metrics` (formato Prometheus, sem autenticação, como `/health/*`; em produção restrinja por rede):
+
+| Métrica | Significado |
+|---|---|
+| `wallet_wager_results_total{source,kind,status}` | resultados por origem (`http`/`sqs`), tipo e status (`PROCESSED`, `REJECTED`, `PENDING_REFERENCE`, `ERROR`) |
+| `wallet_wager_duplicates_total{source}` | repetições respondidas sem reprocessar |
+| `wallet_wager_duration_seconds{source}` | histograma de latência |
+| `wallet_concurrency_conflicts_total` | tentativas repetidas por deadlock/serialização/unicidade concorrente |
+| `wallet_pending_retries_total` | retentativas de referências pendentes |
+| `wallet_sqs_messages_total{result}` | `acked`, `duplicate`, `retried`, `dead_lettered` |
+| `wallet_sqs_dlq_total` | mensagens que o consumidor enviou à DLQ (veneno) |
+| `wallet_outbox_published_total` / `wallet_outbox_publish_failures_total` | publicação da outbox |
+| `wallet_outbox_lag_seconds`, `wallet_outbox_unpublished` | idade do evento mais antigo e quantidade não publicada (−1 se o banco não respondeu) |
+| `wallet_reconciliation_divergences_total` | divergências entre saldo e ledger |
+
+Limite conhecido: mensagens movidas para a DLQ pelo *redrive* da própria fila (após `SQS_MAX_RECEIVE` falhas) acontecem dentro do SQS e **não**
+são contadas por este serviço; o que o serviço vê é cada `retried`. Divergência de reconciliação também vai para o log.
 
 ## Códigos HTTP
 
@@ -137,16 +203,17 @@ Logs JSON (`slog`) com `correlationId` (cabeçalho `X-Correlation-Id` ou gerado,
 - `go.mod` declara `go 1.27.2` (a versão usada no desenvolvimento); o Dockerfile usa `golang:1.27-alpine`.
 - "Três instâncias" nos testes = três `Service` com pools próprios no mesmo processo; três processos não estão automatizados.
 - Contra o Keycloak real há um teste (`-tags keycloak`) e o fluxo do README, mas ambos dependem de subir o compose.
-- O `docker compose` do Keycloak (hostname fixo `localhost:8081`, import do realm) não foi executado no ambiente em que o código foi escrito.
+- O `docker compose` completo (Keycloak com hostname fixo `localhost:8081`, LocalStack) não foi executado no ambiente em que o código foi escrito; lá só rodaram os testes (PostgreSQL real, filas em memória). A execução do compose é verificada na máquina do autor.
+- Os testes de mensageria usam uma fila em memória com a mesma semântica relevante do SQS FIFO (grupo, visibilidade, contagem de entregas, deduplicação, DLQ). O adaptador do SDK da AWS compila, mas só é exercitado contra o LocalStack.
 - Validação de `aud`, introspecção/revogação de token e rotação de segredos não foram implementadas.
 
 ## Não implementado
 
 | Requisito | Situação |
 |---|---|
-| SQS (LocalStack), filas FIFO + DLQ, consumidor, uso da inbox, `MessageGroupId`/`MessageDeduplicationId`, retry/DLQ | **Não implementado** (só a tabela `inbox_messages`) |
-| Publicador da outbox (múltiplos publishers, backoff, recuperação, destino de eventos) | **Não implementado** (eventos são gravados, não publicados) |
-| Métricas (resultados, duplicatas, retries, DLQ, conflitos, atraso da outbox, latência) | **Não implementado** |
-| `FAILED` gravado por algum caminho | Estado existe; sem uso |
-| Controle de acesso à mensageria | Não implementado |
+| `FAILED` gravado por algum caminho | Estado existe; sem uso (falhas técnicas voltam como erro e são retentadas) |
+| Validação de `aud`, introspecção/revogação de token | Não implementado |
+| Política IAM do SQS **aplicada** | Documentada; o LocalStack do compose não a aplica |
+| Execução contra a AWS real | Não testada; só LocalStack (e filas em memória nos testes) |
+| Três processos reais contra o mesmo banco/fila | Não automatizado (os testes usam várias instâncias no mesmo processo) |
 | Tracing OpenTelemetry, partidas dobradas, testes de carga | Opcionais; não feitos |

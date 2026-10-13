@@ -42,6 +42,7 @@ type Service struct {
 	cfg   Config
 	now   func() time.Time
 	newID func() string
+	obs   Observer
 }
 
 // NewService cria o serviço sobre um pool de conexões.
@@ -50,7 +51,18 @@ func NewService(db *sql.DB, cfg Config) *Service {
 		db: db, cfg: cfg.withDefaults(),
 		now:   func() time.Time { return time.Now().UTC() },
 		newID: func() string { return uuid.Must(uuid.NewV7()).String() },
+		obs:   noopObserver{},
 	}
+}
+
+// WithObserver devolve uma cópia que reporta eventos operacionais (métricas) ao observador.
+func (s *Service) WithObserver(o Observer) *Service {
+	c := *s
+	if o == nil {
+		o = noopObserver{}
+	}
+	c.obs = o
+	return &c
 }
 
 // WithClock devolve uma cópia com relógio próprio (usado em testes).
@@ -75,29 +87,71 @@ const maxAttempts = 3
 // Erros de negócio viram transações REJECTED (persistidas e auditáveis); entradas
 // inválidas retornam *wagering.ValidationError sem persistir nada.
 func (s *Service) Process(ctx context.Context, cmd wagering.Command) (Result, error) {
+	return s.ProcessWith(ctx, cmd, Hooks{})
+}
+
+// Hooks permitem ao chamador (o consumidor SQS) participar da MESMA transação SQL do
+// processamento, sem que o serviço conheça mensageria.
+type Hooks struct {
+	// Source identifica a origem nas métricas ("http" quando vazio).
+	Source string
+	// Before roda logo após abrir a transação, antes de travar a carteira. Retornando
+	// skip=true, nada é processado e a transação é desfeita (entrega duplicada).
+	Before func(ctx context.Context, tx *sql.Tx) (skip bool, err error)
+	// After roda antes do commit, depois que a operação foi decidida e gravada.
+	After func(ctx context.Context, tx *sql.Tx, res Result) error
+}
+
+// ProcessWith é Process com ganchos transacionais. Se Before pedir skip, devolve
+// Result{Replay: true} sem Transaction.
+func (s *Service) ProcessWith(ctx context.Context, cmd wagering.Command, h Hooks) (Result, error) {
 	if err := cmd.Validate(); err != nil {
 		return Result{}, err
 	}
+	source := h.Source
+	if source == "" {
+		source = "http"
+	}
+	started := time.Now()
 	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
-		res, err := s.processOnce(ctx, cmd)
+		res, err := s.processOnce(ctx, cmd, h)
 		// Unique violation: outra instância gravou a mesma operação por outra carteira/caminho;
 		// a nova tentativa a encontrará e responderá como replay ou conflito.
 		if err != nil && (isUniqueViolation(err) || isRetryable(err)) {
 			lastErr = err
+			s.obs.ConcurrencyConflict()
 			continue
 		}
+		status := wagering.Status("ERROR")
+		if err == nil && res.Transaction != nil {
+			status = res.Transaction.Status()
+		} else if err == nil {
+			status = "DUPLICATE_SKIPPED"
+		}
+		s.obs.Result(source, cmd.Kind, status, res.Replay, time.Since(started))
 		return res, err
 	}
+	s.obs.Result(source, cmd.Kind, "ERROR", false, time.Since(started))
 	return Result{}, fmt.Errorf("process: giving up after %d attempts: %w", maxAttempts, lastErr)
 }
 
-func (s *Service) processOnce(ctx context.Context, cmd wagering.Command) (Result, error) {
+func (s *Service) processOnce(ctx context.Context, cmd wagering.Command, h Hooks) (Result, error) {
 	tx, err := s.db.BeginTx(ctx, nil) // READ COMMITTED: o lock de linha serializa a carteira
 	if err != nil {
 		return Result{}, err
 	}
 	defer tx.Rollback()
+
+	if h.Before != nil {
+		skip, err := h.Before(ctx, tx)
+		if err != nil {
+			return Result{}, err
+		}
+		if skip {
+			return Result{Replay: true}, nil
+		}
+	}
 
 	w, err := lockWallet(ctx, tx, cmd.WalletID)
 	if err != nil {
@@ -111,6 +165,14 @@ func (s *Service) processOnce(ctx context.Context, cmd wagering.Command) (Result
 	if byKey != nil {
 		if byKey.PayloadHash() != cmd.PayloadHash() {
 			return Result{}, ErrIdempotencyConflict
+		}
+		if h.After != nil {
+			if err := h.After(ctx, tx, Result{Transaction: byKey, Replay: true}); err != nil {
+				return Result{}, err
+			}
+			if err := tx.Commit(); err != nil {
+				return Result{}, err
+			}
 		}
 		return Result{Transaction: byKey, Replay: true}, nil
 	}
@@ -129,6 +191,11 @@ func (s *Service) processOnce(ctx context.Context, cmd wagering.Command) (Result
 	out := wagering.Plan(cmd, wagering.WalletView{PlayerID: w.PlayerID(), Balance: w.Balance()}, ref)
 	if err := s.settle(ctx, tx, w, t, out, ref, false); err != nil {
 		return Result{}, err
+	}
+	if h.After != nil {
+		if err := h.After(ctx, tx, Result{Transaction: t}); err != nil {
+			return Result{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return Result{}, err
@@ -391,7 +458,11 @@ func (s *Service) retryPending(ctx context.Context, id string) error {
 	if err := s.settle(ctx, tx, w, t, out, ref, true); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.obs.PendingRetry()
+	return nil
 }
 
 // RunPendingWorker retenta pendências periodicamente até ctx ser cancelado.
@@ -551,6 +622,7 @@ func (s *Service) Reconcile(ctx context.Context, walletID string) (Reconciliatio
 	r := Reconciliation{WalletID: walletID, Stored: w.Balance(), Calculated: calc, Difference: diff,
 		Consistent: diff.IsZero(), CheckedEntries: n}
 	if !r.Consistent {
+		s.obs.ReconciliationDivergence()
 		slog.Error("divergência de reconciliação", "walletId", walletID, "stored", r.Stored.Amount(), "calculated", r.Calculated.Amount(), "difference", diff.Amount())
 	}
 	return r, nil

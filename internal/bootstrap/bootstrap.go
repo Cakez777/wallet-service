@@ -21,6 +21,7 @@ import (
 	"github.com/Cakez777/wallet-service/internal/app"
 	"github.com/Cakez777/wallet-service/internal/auth"
 	"github.com/Cakez777/wallet-service/internal/httpapi"
+	"github.com/Cakez777/wallet-service/internal/metrics"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"go.uber.org/fx"
 )
@@ -32,6 +33,7 @@ type Config struct {
 	OIDCIssuer     string // valor exato do claim iss
 	OIDCJWKSURL    string // endpoint de chaves públicas do IdP
 	Pending        app.Config
+	Messaging      MessagingConfig
 	WorkerInterval time.Duration
 	ShutdownGrace  time.Duration
 }
@@ -92,6 +94,11 @@ func LoadConfig() (Config, error) {
 		PendingBaseDelay:   time.Duration(baseMs) * time.Millisecond,
 		PendingMaxDelay:    time.Duration(maxMs) * time.Millisecond,
 	}
+	mc, err := loadMessagingConfig()
+	if err != nil {
+		return Config{}, err
+	}
+	c.Messaging = mc
 	c.WorkerInterval = time.Duration(workerMs) * time.Millisecond
 	c.ShutdownGrace = time.Duration(graceS) * time.Second
 	return c, nil
@@ -122,14 +129,21 @@ func newDB(lc fx.Lifecycle, cfg Config) (*sql.DB, error) {
 	return db, nil
 }
 
-func newService(db *sql.DB, cfg Config) *app.Service { return app.NewService(db, cfg.Pending) }
+func newService(db *sql.DB, cfg Config, reg *metrics.Registry) *app.Service {
+	return app.NewService(db, cfg.Pending).WithObserver(reg)
+}
 
 func newVerifier(cfg Config) httpapi.TokenVerifier {
 	return auth.NewVerifier(cfg.OIDCIssuer, cfg.OIDCJWKSURL)
 }
 
-func newAPI(svc *app.Service, v httpapi.TokenVerifier, db *sql.DB) *httpapi.API {
-	return httpapi.New(svc, v, func(ctx context.Context) error { return db.PingContext(ctx) })
+func newAPI(svc *app.Service, v httpapi.TokenVerifier, db *sql.DB, m *Messaging, reg *metrics.Registry) *httpapi.API {
+	return httpapi.New(svc, v, func(ctx context.Context) error {
+		if err := db.PingContext(ctx); err != nil {
+			return err
+		}
+		return m.Ready(ctx)
+	}).WithMetrics(reg.Handler())
 }
 
 func startServer(lc fx.Lifecycle, cfg Config, api *httpapi.API) {
@@ -186,11 +200,12 @@ func startWorker(lc fx.Lifecycle, svc *app.Service, cfg Config) {
 	})
 }
 
-// Module agrupa toda a composição. startWorker é invocado antes de startServer para que,
-// no encerramento, o servidor pare primeiro, depois o worker, e por fim o banco.
+// Module agrupa toda a composição. A ordem dos Invoke define a ordem de encerramento (inversa
+// à de início): o servidor HTTP para primeiro; depois consumidor SQS e publicador da outbox
+// (concluem o que está em andamento); depois o worker de pendências; por fim o pool do banco.
 func Module() fx.Option {
 	return fx.Module("wallet",
-		fx.Provide(LoadConfig, newDB, newService, newVerifier, newAPI),
-		fx.Invoke(startWorker, startServer),
+		fx.Provide(LoadConfig, newDB, newService, newVerifier, newAPI, newMetrics, newMessaging),
+		fx.Invoke(startWorker, startMessaging, startServer),
 	)
 }

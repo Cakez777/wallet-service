@@ -43,6 +43,21 @@ services:
     volumes:
       - ./deploy/keycloak/realm-wallet.json:/opt/keycloak/data/import/realm-wallet.json:ro
 
+  # SQS local (LocalStack, versão fixada: as mais novas exigem token de conta).
+  # As filas FIFO e as DLQs são criadas pelo próprio app na inicialização.
+  localstack:
+    image: localstack/localstack:3.8.1
+    container_name: wallet_localstack
+    environment:
+      SERVICES: sqs
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -Eq '\"sqs\": \"(available|running)\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   app:
     build: .
     container_name: wallet_service
@@ -50,6 +65,10 @@ services:
       DATABASE_URL: postgres://wallet:wallet@postgres:5432/wallet?sslmode=disable
       OIDC_ISSUER: http://localhost:8081/realms/wallet
       OIDC_JWKS_URL: http://keycloak:8080/realms/wallet/protocol/openid-connect/certs
+      SQS_ENDPOINT: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
     ports:
       - "8080:8080"
     depends_on:
@@ -57,6 +76,8 @@ services:
         condition: service_completed_successfully
       keycloak:
         condition: service_started
+      localstack:
+        condition: service_healthy
 
 volumes:
   postgres_data:

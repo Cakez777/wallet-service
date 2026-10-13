@@ -38,7 +38,12 @@ type API struct {
 	svc      *app.Service
 	verifier TokenVerifier
 	ready    func(ctx context.Context) error
+	metrics  http.Handler
 }
+
+// WithMetrics publica GET /metrics (formato Prometheus), sem autenticação, como /health/*.
+// Em produção, restrinja o acesso por rede (a porta não deve ser exposta publicamente).
+func (a *API) WithMetrics(h http.Handler) *API { a.metrics = h; return a }
 
 // New cria a API. ready verifica as dependências (PostgreSQL) para /health/ready.
 func New(svc *app.Service, v TokenVerifier, ready func(ctx context.Context) error) *API {
@@ -59,6 +64,9 @@ func (a *API) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("GET /health/ready", a.handleReady)
+	if a.metrics != nil {
+		mux.Handle("GET /metrics", a.metrics)
+	}
 
 	internal := func(h http.HandlerFunc) http.Handler { return a.require(auth.RoleInternal, h) }
 	provider := func(h http.HandlerFunc) http.Handler { return a.require(auth.RoleProvider, h) }

@@ -35,6 +35,7 @@ func setEnv(t *testing.T, dsn, addr string) {
 	t.Setenv("OIDC_ISSUER", "http://idp.test/realms/wallet")
 	t.Setenv("OIDC_JWKS_URL", "http://127.0.0.1:1/jwks") // IdP inalcançável: só /health é público
 	t.Setenv("WORKER_INTERVAL_MS", "50")
+	t.Setenv("MESSAGING_ENABLED", "false")
 }
 
 func get(t *testing.T, url string) int {
