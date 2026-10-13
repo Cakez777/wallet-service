@@ -14,7 +14,7 @@ services:
       test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   # Aplica as migrations "up" e termina. O app só sobe depois que ele conclui.
   migrate:
@@ -26,16 +26,58 @@ services:
       postgres:
         condition: service_healthy
 
+  # IdP OAuth 2.0 / OIDC. O realm "wallet" (clientes e papéis de teste) é importado na subida.
+  # O issuer fixo é http://localhost:8081/realms/wallet, igual para quem consulta de fora ou de dentro da rede.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: wallet_keycloak
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HOSTNAME: http://localhost:8081
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_ENABLED: "true"
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./deploy/keycloak/realm-wallet.json:/opt/keycloak/data/import/realm-wallet.json:ro
+
+  # SQS local (LocalStack, versão fixada: as mais novas exigem token de conta).
+  # As filas FIFO e as DLQs são criadas pelo próprio app na inicialização.
+  localstack:
+    image: localstack/localstack:3.8.1
+    container_name: wallet_localstack
+    environment:
+      SERVICES: sqs
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -Eq '\"sqs\": \"(available|running)\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   app:
     build: .
     container_name: wallet_service
     environment:
       DATABASE_URL: postgres://wallet:wallet@postgres:5432/wallet?sslmode=disable
+      OIDC_ISSUER: http://localhost:8081/realms/wallet
+      OIDC_JWKS_URL: http://keycloak:8080/realms/wallet/protocol/openid-connect/certs
+      SQS_ENDPOINT: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
     ports:
       - "8080:8080"
     depends_on:
       migrate:
         condition: service_completed_successfully
+      keycloak:
+        condition: service_started
+      localstack:
+        condition: service_healthy
 
 volumes:
   postgres_data:

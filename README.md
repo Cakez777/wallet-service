@@ -1,89 +1,185 @@
 # Wallet Service
 
-Serviço em Go para movimentação de carteiras de jogadores, desenvolvido como resposta ao
-desafio backend da Jungle Gaming (processamento distribuído de apostas).
+Serviço em Go (Uber Fx, PostgreSQL, Keycloak) que processa operações financeiras de provedores de
+jogos — `BET`, `WIN`, `LOSS`, `REFUND` e `ROLLBACK` — sobre carteiras de jogadores, com idempotência
+persistente, ledger imutável e coordenação por carteira. Resposta ao desafio backend da Jungle Gaming.
 
-> **Estado atual: implementação parcial.** Veja a seção "O que está pronto e o que falta"
-> e o arquivo [ARCHITECTURE.md](ARCHITECTURE.md), que lista as decisões, as limitações e o
-> trabalho não concluído.
+> **Estado:** núcleo financeiro, API, autenticação, SQS (consumidor + inbox), publicador da outbox, métricas e testes.
+> Veja [ARCHITECTURE.md](ARCHITECTURE.md) para as decisões, interpretações e o que **não** foi feito.
 
 ## Pré-requisitos
 
-- Go (versão declarada em `go.mod`)
-- Docker e Docker Compose
+Go (versão do `go.mod`), Docker e Docker Compose.
 
-## Como executar
+## Executar
 
 ```
+cp .env.example .env      # opcional; o compose já define as variáveis do app
+go mod tidy               # gera/atualiza go.sum (necessário uma vez após clonar)
 docker compose up --build
 ```
 
-Isso sobe o PostgreSQL, aplica as migrations (serviço `migrate`) e inicia a API em
-`http://localhost:8080`.
+Sobe PostgreSQL, aplica as migrations (`migrate`), sobe o Keycloak (realm `wallet` importado) e a API
+em `http://localhost:8080`. O Keycloak leva alguns segundos; até lá a API responde `503` aos endpoints
+autenticados (não consegue validar tokens).
 
-Para rodar a API fora do Docker (com o Postgres do compose já no ar):
-
-```
-cp .env.example .env      # opcional; o padrão já aponta para localhost
-go run .
-```
+Fora do Docker: `docker compose up -d postgres migrate keycloak`, depois `go run .` com as variáveis de
+`.env.example` exportadas.
 
 ## Variáveis de ambiente
 
-| Variável       | Descrição                    | Padrão local                                               |
-|----------------|------------------------------|------------------------------------------------------------|
-| `DATABASE_URL` | String de conexão PostgreSQL | `postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable` |
+| Variável | Descrição | Padrão |
+|---|---|---|
+| `DATABASE_URL` | PostgreSQL | `postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable` |
+| `OIDC_ISSUER` | valor exato do claim `iss` | **obrigatória** |
+| `OIDC_JWKS_URL` | chaves públicas do IdP | **obrigatória** |
+| `HTTP_ADDR` | endereço do servidor | `:8080` |
+| `PENDING_MAX_ATTEMPTS` | tentativas antes de rejeitar uma referência ausente | `8` |
+| `PENDING_BASE_DELAY_MS` / `PENDING_MAX_DELAY_MS` | backoff exponencial | `2000` / `300000` |
+| `WORKER_INTERVAL_MS` | intervalo do worker de pendências | `1000` |
+| `SHUTDOWN_GRACE_SECONDS` | prazo do shutdown do HTTP | `20` |
+| `MESSAGING_ENABLED` | `false` desliga consumidor, publicador e criação de filas | `true` |
+| `SQS_ENDPOINT` | LocalStack (`http://localstack:4566`); vazio = AWS real | vazio |
+| `AWS_REGION` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | região e credenciais do SDK | `us-east-1` / — / — |
+| `COMMANDS_QUEUE_NAME` / `COMMANDS_DLQ_NAME` | fila de comandos e sua DLQ | `wager-transactions.fifo` / `wager-transactions-dlq.fifo` |
+| `EVENTS_QUEUE_NAME` / `EVENTS_DLQ_NAME` | fila de eventos e sua DLQ | `wallet-events.fifo` / `wallet-events-dlq.fifo` |
+| `SQS_MAX_RECEIVE` | entregas antes de a fila mover a mensagem para a DLQ | `5` |
+| `SQS_VISIBILITY_SECONDS` | visibilidade (deve ser > 30) | `60` |
+| `CONSUMER_WORKERS` | goroutines de consumo por instância | `4` |
+| `OUTBOX_INTERVAL_MS` / `OUTBOX_BATCH` | cadência e tamanho de lote do publicador | `500` / `20` |
+
+## Autenticação (fluxos de teste)
+
+O Keycloak do compose (`http://localhost:8081`, admin `admin/admin`) tem clientes `client_credentials`:
+
+| Cliente | Segredo | Papel | Uso |
+|---|---|---|---|
+| `provider-a` | `provider-a-secret` | `wallet-provider` | provedor A (o `clientId` é o `providerId`) |
+| `provider-b` | `provider-b-secret` | `wallet-provider` | provedor B |
+| `wallet-internal-service` | `internal-secret` | `wallet-internal` | operações de carteira |
+
+Obter um token (PowerShell):
+
+```
+$t = (Invoke-RestMethod -Method Post -Uri http://localhost:8081/realms/wallet/protocol/openid-connect/token `
+  -Body @{grant_type='client_credentials'; client_id='wallet-internal-service'; client_secret='internal-secret'}).access_token
+```
+
+Com `curl`: `curl -s -d grant_type=client_credentials -d client_id=provider-a -d client_secret=provider-a-secret http://localhost:8081/realms/wallet/protocol/openid-connect/token`.
+
+## Exemplos de chamadas
+
+```
+# abrir carteira (token interno)
+curl -X POST localhost:8080/wallets -H "Authorization: Bearer $INTERNAL" -H "Content-Type: application/json" \
+  -d '{"playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","initialBalance":{"amount":"1000.00","currency":"BRL"}}'
+
+# apostar (token do provedor A)
+curl -X POST localhost:8080/wagering/transactions -H "Authorization: Bearer $PROVIDER_A" \
+  -H "Idempotency-Key: provider-a:transaction-123" -H "Content-Type: application/json" \
+  -d '{"providerId":"provider-a","externalTransactionId":"transaction-123","playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":"<id>","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}'
+```
+
+Endpoints: `POST /wallets`, `GET /wallets/{id}`, `GET /wallets/{id}/ledger?cursor=&limit=`,
+`POST /wallets/{id}/reconciliation` (papel interno); `POST /wagering/transactions`,
+`GET /wagering/transactions/{id}`, `GET /providers/{providerId}/wagering/transactions/{externalId}`
+(provedor: só as suas); `GET /health/live`, `GET /health/ready` (públicos). Códigos HTTP e corpos de erro
+estão no ARCHITECTURE.md.
+
+## Mensageria (SQS) e métricas
+
+`docker compose up --build` sobe também o LocalStack; o app cria as filas FIFO e as DLQs na inicialização.
+`/health/ready` só fica `ok` com PostgreSQL e as duas filas respondendo. Métricas: `GET http://localhost:8080/metrics`.
+
+Enviar um comando pela fila (PowerShell; troque `WALLET_ID`/`PLAYER_ID` pelos valores da carteira criada):
+
+```powershell
+@'
+{"providerId":"provider-a","idempotencyKey":"sqs-key-1","externalTransactionId":"sqs-ext-1","playerId":"PLAYER_ID","walletId":"WALLET_ID","roundId":"r1","gameId":"g1","kind":"BET","money":{"amount":"10.00","currency":"BRL"}}
+'@ | Set-Content -Encoding ascii msg.json
+docker cp msg.json wallet_localstack:/tmp/msg.json
+docker exec wallet_localstack awslocal sqs send-message --queue-url http://localhost:4566/000000000000/wager-transactions.fifo --message-group-id WALLET_ID --message-deduplication-id sqs-key-1 --message-body file:///tmp/msg.json
+```
+
+Depois consulte o saldo pela API e leia os eventos publicados:
+
+```powershell
+docker exec wallet_localstack awslocal sqs receive-message --queue-url http://localhost:4566/000000000000/wallet-events.fifo --max-number-of-messages 5
+docker exec wallet_localstack awslocal sqs receive-message --queue-url http://localhost:4566/000000000000/wager-transactions-dlq.fifo
+```
+
+Reenviar a mesma mensagem (outro `--message-deduplication-id`, mesma `idempotencyKey`) não debita de novo: a inbox a reconhece.
 
 ## Migrations
 
-Ficam em `db/migrations`, no formato do [golang-migrate](https://github.com/golang-migrate/migrate)
-(`NNNNNN_nome.up.sql` e `NNNNNN_nome.down.sql`).
-
-Aplicar (feito automaticamente pelo `docker compose up`):
+`db/migrations`, formato golang-migrate (`NNNNNN_nome.up.sql` / `.down.sql`). Aplicadas pelo `docker compose up`.
 
 ```
-docker compose run --rm migrate up
+docker compose run --rm migrate up          # aplicar
+docker compose run --rm migrate down 1      # reverter a última
 ```
 
-Reverter a última migration:
-
-```
-docker compose run --rm migrate down 1
-```
+Mudou o schema? Recrie o volume: `docker compose down -v`.
 
 ## Testes
 
 ```
-go test ./...
+go test ./...             # unitários: money, wallet, wagering, auth (IdP simulado com RSA/JWKS)
 go vet ./...
 go test -race ./...
 ```
 
-Hoje só o pacote `internal/money` tem testes que rodam de verdade. O teste de concorrência
-de `internal/wallet` está marcado com `t.Skip` e **não** valida nada ainda.
+Integração (PostgreSQL **real**; cada execução cria e remove um banco próprio):
 
-## Endpoints atuais
+```
+docker compose up -d postgres
+export TEST_DATABASE_URL='postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable'   # PowerShell: $env:TEST_DATABASE_URL=...
+go test -tags integration -race -count=1 ./...
+```
 
-- `GET /health/live` e `GET /health/ready` (readiness consulta o PostgreSQL)
-- `POST /wallets` (hoje recebe `player_id` e `currency`; ainda **não** segue o contrato do desafio)
-- `POST /wallets/{id}/deposit` e `POST /wallets/{id}/withdraw` (domínio provisório de
-  depósito/saque, a ser substituído por `POST /wagering/transactions`)
+Cobrem: 50 envios idênticos em paralelo (um único débito), duas apostas de 80.00 sobre 100.00,
+carteiras independentes em paralelo, reversões simultâneas, referências pendentes (resolução e expiração,
+com vários workers), consumidor SQS (entregas duplicadas, duas instâncias na mesma carteira sem saldo negativo e em ordem, mensagens veneno → DLQ,
+falha antes do commit, falha no delete após o commit, encerramento gracioso), publicador da outbox (vários publicadores sem publicação dupla,
+ordem por agregado, fila fora do ar e recuperação, concessão expirada), imutabilidade e invariantes impostas pelo banco, isolamento entre provedores,
+códigos HTTP, e o ciclo de vida do Fx (início, falha de config/banco/porta, encerramento e liberação de recursos).
 
-## O que está pronto e o que falta
+Autenticação contra o **Keycloak real** (exige `docker compose up -d keycloak`):
 
-Pronto:
+```
+go test -tags keycloak -count=1 ./internal/auth/
+```
 
-- `Money` (centavos em `int64`, escala fixa de 2 casas, moeda, overflow tratado) com testes.
-- Schema com `CHECK (balance >= 0)` e `UNIQUE (player_id, currency)`.
-- Atualização de saldo com `SELECT ... FOR UPDATE` e controle de versão.
-- Health checks e logs JSON.
+Três **processos do sistema operacional** disputando a mesma carteira (o binário de teste é reexecutado três vezes,
+cada processo com seu pool; largada sincronizada): `TestThreeProcessesRaceTwoBetsOf80On100` (6 apostas simultâneas de 80.00
+sobre 100.00: exatamente 1 processada, saldo 20.00, 1 débito) e `TestThreeProcessesSendTheSameIdempotentBet`
+(60 envios idênticos vindos de 3 processos: 1 débito). Rodam com `-tags integration`.
 
-Não implementado (requisitos obrigatórios do desafio):
+Mensageria contra um **SQS real** (LocalStack; filas FIFO e DLQ com redrive criadas pelo teste, consumidor e publicador
+reais, sem fila em memória). Exige `docker compose up -d postgres localstack`:
 
-- Autenticação/autorização (OAuth2/OIDC com Keycloak).
-- Domínio de apostas (`WagerTransaction`, `BET`/`WIN`/`LOSS`/`REFUND`/`ROLLBACK`) e ledger
-  append-only com `balanceBefore`/`balanceAfter`.
-- Idempotência completa (detecção de duplicata, hash do payload e `idempotentReplay`).
-- SQS (LocalStack), inbox, outbox e worker publicador.
-- Uber Fx na composição.
-- Testes de integração contra banco real e testes de concorrência.
+```
+go test -tags localstack -count=1 -v ./internal/inbound/
+```
+
+Cobrem: reentregas e comandos repetidos (a inbox os ignora), duas instâncias na mesma carteira sem saldo negativo e em ordem,
+mensagens inválidas na DLQ, falha antes do commit com retentativa (aplicada uma única vez), redrive para a DLQ após o limite
+de entregas, e publicação da outbox numa fila de eventos real com deduplicação por `eventId`. Os testes com
+`-tags integration` usam uma fila em memória com a mesma semântica para rodar rápido e sem Docker além do PostgreSQL.
+
+## Estrutura
+
+```
+internal/money      value object Money (centavos int64 + moeda)
+internal/wallet     agregado Wallet e LedgerEntry (domínio puro)
+internal/wagering   comando, WagerTransaction, estados, regras (Plan) e eventos (domínio puro)
+internal/app        casos de uso e acesso ao PostgreSQL
+internal/inbound    consumidor SQS + inbox transacional
+internal/outbox     publicador da outbox (lease, SKIP LOCKED, backoff)
+internal/messaging  abstração de fila, adaptador SQS (AWS SDK v2) e fila FIFO em memória (testes)
+internal/metrics    métricas em formato Prometheus
+internal/auth       validação de JWT (JWKS)
+internal/httpapi    handlers, autenticação/autorização, contratos
+internal/bootstrap  composição com Uber Fx e ciclo de vida
+db/migrations       schema; deploy/keycloak  realm importado
+```
