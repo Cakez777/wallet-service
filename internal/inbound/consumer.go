@@ -25,7 +25,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,8 +40,8 @@ import (
 // ErrInboxConflict: o mesmo messageId chegou com conteúdo diferente.
 var ErrInboxConflict = errors.New("message id already used with a different payload")
 
-// CommandMessage é o corpo (JSON) das mensagens da fila de comandos. Equivale ao corpo HTTP
-// de POST /wagering/transactions, com a chave de idempotência no corpo em vez do cabeçalho.
+// CommandMessage representa os dados de negócio dentro de data.
+// Os campos de envelope são utilizados apenas pelos produtores e testes.
 type CommandMessage struct {
 	ProviderID                     string             `json:"providerId"`
 	IdempotencyKey                 string             `json:"idempotencyKey"`
@@ -52,35 +54,132 @@ type CommandMessage struct {
 	Money                          wagering.MoneyData `json:"money"`
 	ReferenceExternalTransactionID string             `json:"referenceExternalTransactionId,omitempty"`
 	CorrelationID                  string             `json:"correlationId,omitempty"`
+
+	// Metadados do envelope. Não são serializados diretamente dentro de data.
+	MessageID  string `json:"-"`
+	Type       string `json:"-"`
+	OccurredAt string `json:"-"`
+}
+
+// commandEnvelope representa o contrato oficial da mensagem publicada na fila.
+type commandEnvelope struct {
+	MessageID  string         `json:"messageId"`
+	Type       string         `json:"type"`
+	OccurredAt string         `json:"occurredAt"`
+	Data       CommandMessage `json:"data"`
+}
+
+// decodeEnvelope valida o envelope e converte seus dados em um comando.
+// Também retorna o messageId definido pelo produtor.
+func decodeEnvelope(body string) (wagering.Command, string, error) {
+	var envelope commandEnvelope
+
+	dec := json.NewDecoder(bytes.NewReader([]byte(body)))
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(&envelope); err != nil {
+		return wagering.Command{}, "", fmt.Errorf("malformed message: %w", err)
+	}
+
+	// Não permite conteúdo adicional depois do objeto JSON.
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return wagering.Command{}, "", fmt.Errorf("malformed message: multiple JSON values")
+		}
+		return wagering.Command{}, "", fmt.Errorf("malformed message: %w", err)
+	}
+
+	if strings.TrimSpace(envelope.MessageID) == "" {
+		return wagering.Command{}, "", fmt.Errorf("malformed message: messageId is required")
+	}
+
+	if envelope.Type != "WagerTransactionRequested" {
+		return wagering.Command{}, "", fmt.Errorf(
+			"malformed message: unsupported message type %q",
+			envelope.Type,
+		)
+	}
+
+	if strings.TrimSpace(envelope.OccurredAt) == "" {
+		return wagering.Command{}, "", fmt.Errorf("malformed message: occurredAt is required")
+	}
+
+	if _, err := time.Parse(time.RFC3339Nano, envelope.OccurredAt); err != nil {
+		return wagering.Command{}, "", fmt.Errorf(
+			"malformed message: invalid occurredAt: %w",
+			err,
+		)
+	}
+
+	m := envelope.Data
+
+	mo, err := money.Parse(m.Money.Amount, m.Money.Currency)
+	if err != nil {
+		return wagering.Command{}, "", &wagering.ValidationError{
+			Field:  "money",
+			Reason: err.Error(),
+		}
+	}
+
+	cmd := wagering.Command{
+		ProviderID:                     m.ProviderID,
+		ExternalTransactionID:          m.ExternalTransactionID,
+		IdempotencyKey:                 m.IdempotencyKey,
+		PlayerID:                       m.PlayerID,
+		WalletID:                       m.WalletID,
+		RoundID:                        m.RoundID,
+		GameID:                         m.GameID,
+		Kind:                           wagering.Kind(m.Kind),
+		Money:                          mo,
+		ReferenceExternalTransactionID: m.ReferenceExternalTransactionID,
+		CorrelationID:                  m.CorrelationID,
+	}
+
+	if err := cmd.Validate(); err != nil {
+		return wagering.Command{}, "", err
+	}
+
+	return cmd, envelope.MessageID, nil
 }
 
 // Decode converte e valida o corpo da mensagem.
+// Mantém a assinatura utilizada pelos testes e outros componentes internos.
 func Decode(body string) (wagering.Command, error) {
-	var m CommandMessage
-	dec := json.NewDecoder(bytes.NewReader([]byte(body)))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&m); err != nil {
-		return wagering.Command{}, fmt.Errorf("malformed message: %w", err)
-	}
-	mo, err := money.Parse(m.Money.Amount, m.Money.Currency)
-	if err != nil {
-		return wagering.Command{}, &wagering.ValidationError{Field: "money", Reason: err.Error()}
-	}
-	cmd := wagering.Command{
-		ProviderID: m.ProviderID, ExternalTransactionID: m.ExternalTransactionID, IdempotencyKey: m.IdempotencyKey,
-		PlayerID: m.PlayerID, WalletID: m.WalletID, RoundID: m.RoundID, GameID: m.GameID,
-		Kind: wagering.Kind(m.Kind), Money: mo, ReferenceExternalTransactionID: m.ReferenceExternalTransactionID,
-		CorrelationID: m.CorrelationID,
-	}
-	if err := cmd.Validate(); err != nil {
-		return wagering.Command{}, err
-	}
-	return cmd, nil
+	cmd, _, err := decodeEnvelope(body)
+	return cmd, err
 }
 
-// Encode gera o corpo da mensagem (usado por produtores internos e testes).
+// Encode gera uma mensagem no formato oficial do envelope.
+// É utilizado pelos produtores internos e pelos testes.
 func Encode(m CommandMessage) string {
-	b, _ := json.Marshal(m)
+	messageID := m.MessageID
+	if messageID == "" {
+		messageID = m.ProviderID + ":" + m.IdempotencyKey
+	}
+
+	messageType := m.Type
+	if messageType == "" {
+		messageType = "WagerTransactionRequested"
+	}
+
+	occurredAt := m.OccurredAt
+	if occurredAt == "" {
+		occurredAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+
+	envelope := commandEnvelope{
+		MessageID:  messageID,
+		Type:       messageType,
+		OccurredAt: occurredAt,
+		Data:       m,
+	}
+
+	b, err := json.Marshal(envelope)
+	if err != nil {
+		return ""
+	}
+
 	return string(b)
 }
 
@@ -224,16 +323,17 @@ var errMalformed = errors.New("malformed message")
 // handle processa uma mensagem. Retorna false se ela NÃO foi concluída (devolvida à fila ou
 // enviada à DLQ por falha), para que o chamador segure as mensagens seguintes do mesmo grupo.
 func (c *Consumer) handle(ctx context.Context, m messaging.Message) bool {
-	cmd, err := Decode(m.Body)
+	cmd, messageID, err := decodeEnvelope(m.Body)
 	if err != nil {
 		return c.deadLetter(ctx, m, fmt.Errorf("%w: %v", errMalformed, err))
 	}
+
 	if cmd.CorrelationID == "" {
-		// Como no HTTP, toda operação tem um correlationId; sem um do produtor, usa o id da
-		// mensagem SQS. Não entra no hash do payload, então não afeta a idempotência.
-		cmd.CorrelationID = m.ID
+		// Usa o messageId do envelope como correlationId padrão.
+		// O correlationId não altera o hash financeiro.
+		cmd.CorrelationID = messageID
 	}
-	messageID := cmd.ProviderID + ":" + cmd.IdempotencyKey
+
 	hash := cmd.PayloadHash()
 	name := c.cfg.Name
 
@@ -271,10 +371,10 @@ func (c *Consumer) handle(ctx context.Context, m messaging.Message) bool {
 			return c.deadLetter(ctx, m, err)
 		}
 		delay := c.backoff(m.ReceiveCount)
-		slog.Warn("falha transitória; mensagem volta à fila", "messageId", m.ID, "dedupKey", messageID,
+		slog.Warn("falha transitória; mensagem volta à fila", "messageId", messageID, "sqsMessageId", m.ID,
 			"receiveCount", m.ReceiveCount, "retryIn", delay, "error", err)
 		if rerr := c.queue.Release(ctx, m.ReceiptHandle, delay); rerr != nil {
-			slog.Error("falha ao devolver mensagem à fila", "messageId", m.ID, "error", rerr)
+			slog.Error("falha ao devolver mensagem à fila", "messageId", messageID, "error", rerr)
 		}
 		c.obs.SQSResult("retried")
 		return false
@@ -283,23 +383,28 @@ func (c *Consumer) handle(ctx context.Context, m messaging.Message) bool {
 	// Commit feito: só agora a mensagem sai da fila.
 	if derr := c.queue.Delete(ctx, m.ReceiptHandle); derr != nil {
 		// Segue válido: a mensagem voltará e será reconhecida como duplicata pela inbox.
-		slog.Error("falha ao apagar mensagem após o commit (será tratada como duplicata)", "messageId", m.ID, "error", derr)
+		slog.Error("falha ao apagar mensagem após o commit (será tratada como duplicata)",
+			"messageId", messageID, "sqsMessageId", m.ID, "error", derr)
 	}
 	if res.Transaction == nil || res.Replay {
 		c.obs.SQSResult("duplicate")
 	} else {
 		c.obs.SQSResult("acked")
 	}
-	slog.Info("mensagem processada", "messageId", m.ID, "dedupKey", messageID, "replay", res.Replay,
-		"correlationId", cmd.CorrelationID)
+	slog.Info("mensagem processada", "messageId", messageID, "sqsMessageId", m.ID,
+		"replay", res.Replay, "correlationId", cmd.CorrelationID)
 	return true
 }
 
 // deadLetter envia a mensagem veneno à DLQ e a apaga da fila principal.
 func (c *Consumer) deadLetter(ctx context.Context, m messaging.Message, cause error) bool {
-	slog.Error("mensagem inválida enviada à DLQ", "messageId", m.ID, "error", cause)
+	slog.Error("mensagem inválida enviada à DLQ", "sqsMessageId", m.ID, "error", cause)
 	if c.dlq != nil {
-		err := c.dlq.Send(ctx, messaging.SendInput{Body: m.Body, GroupID: nonEmpty(m.GroupID, "poison"), DeduplicationID: "dlq-" + m.ID})
+		err := c.dlq.Send(ctx, messaging.SendInput{
+			Body:            m.Body,
+			GroupID:         nonEmpty(m.GroupID, "poison"),
+			DeduplicationID: "dlq-" + m.ID,
+		})
 		if err != nil {
 			// Não conseguiu mover: devolve; o redrive da fila a levará à DLQ depois.
 			_ = c.queue.Release(ctx, m.ReceiptHandle, c.backoff(m.ReceiveCount))
