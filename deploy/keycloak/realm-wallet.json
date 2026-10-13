@@ -1,0 +1,34 @@
+{
+  "realm": "wallet",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 300,
+  "roles": {
+    "realm": [
+      { "name": "wallet-provider", "description": "Provedor de jogos: envia e consulta as próprias transações" },
+      { "name": "wallet-internal", "description": "Serviço interno: operações de carteira" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "provider-a", "enabled": true, "protocol": "openid-connect",
+      "publicClient": false, "clientAuthenticatorType": "client-secret", "secret": "provider-a-secret",
+      "serviceAccountsEnabled": true, "standardFlowEnabled": false, "directAccessGrantsEnabled": false
+    },
+    {
+      "clientId": "provider-b", "enabled": true, "protocol": "openid-connect",
+      "publicClient": false, "clientAuthenticatorType": "client-secret", "secret": "provider-b-secret",
+      "serviceAccountsEnabled": true, "standardFlowEnabled": false, "directAccessGrantsEnabled": false
+    },
+    {
+      "clientId": "wallet-internal-service", "enabled": true, "protocol": "openid-connect",
+      "publicClient": false, "clientAuthenticatorType": "client-secret", "secret": "internal-secret",
+      "serviceAccountsEnabled": true, "standardFlowEnabled": false, "directAccessGrantsEnabled": false
+    }
+  ],
+  "users": [
+    { "username": "service-account-provider-a", "enabled": true, "serviceAccountClientId": "provider-a", "realmRoles": ["wallet-provider"] },
+    { "username": "service-account-provider-b", "enabled": true, "serviceAccountClientId": "provider-b", "realmRoles": ["wallet-provider"] },
+    { "username": "service-account-wallet-internal-service", "enabled": true, "serviceAccountClientId": "wallet-internal-service", "realmRoles": ["wallet-internal"] }
+  ]
+}

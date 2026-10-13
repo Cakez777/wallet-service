@@ -132,8 +132,3 @@ func (m Money) Cmp(o Money) (int, error) {
 	}
 	return 0, nil
 }
-
-// MarshalJSON implementa a interface json.Marshaler para serializar Money corretamente no JSON da API.
-func (m Money) MarshalJSON() ([]byte, error) {
-	return []byte(fmt.Sprintf(`{"amount":"%s","currency":"%s"}`, m.Amount(), m.currency)), nil
-}
