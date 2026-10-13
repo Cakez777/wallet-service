@@ -1,219 +1,485 @@
 # Arquitetura e decisões
 
-Documento de decisões, interpretações e limitações. Tudo o que está marcado como implementado tem teste
-que o exercita (veja README); o que não existe está na seção final.
+Este documento descreve a arquitetura do Wallet Service, suas decisões de implementação, as regras de negócio e as limitações conhecidas.
 
-## Visão geral
+Os comportamentos descritos como implementados devem ser conferidos no código e nos testes correspondentes. A existência de um teste não substitui sua execução no ambiente de avaliação.
 
-API HTTP + worker no mesmo binário, estado exclusivamente no PostgreSQL (nada em memória que afete
-correção), então qualquer número de instâncias pode rodar ao mesmo tempo. Camadas: `money`/`wallet`/`wagering`
-(domínio puro, sem HTTP/SQL/Fx) → `app` (casos de uso + SQL explícito) → `httpapi` → `bootstrap` (Fx).
+## 1. Visão geral
 
-## Dinheiro
+A aplicação reúne uma API HTTP e workers no mesmo binário. O PostgreSQL é a fonte persistente de estado financeiro, permitindo que várias instâncias da aplicação operem sobre os mesmos dados.
 
-- `int64` em centavos + moeda (3 letras maiúsculas). Nenhum `float` em parsing, cálculo, serialização ou persistência.
-- Entrada: string decimal com **exatamente duas casas** (`"25.00"`); rejeita vazio, sinal, notação científica,
-  `NaN`/`Infinity`, escala diferente de 2 e overflow. Não há normalização (logo, o hash de idempotência é estável).
-- Overflow tratado em parse, soma, subtração e negação (limite: `MaxInt64` centavos). Moedas diferentes → `ErrCurrencyMismatch`.
-- Persistência: `BIGINT` em centavos. Biblioteca: `database/sql` + `pgx/stdlib`, SQL escrito à mão; transações,
-  locks e constraints explícitos em `internal/app/store.go` e na migration.
-- A moeda é validada pelo formato, não contra a lista ISO 4217 completa.
+A arquitetura é organizada em camadas:
 
-## Transações SQL e concorrência
+- `internal/money`: representação e operações monetárias.
+- `internal/wallet`: agregado de carteira e lançamentos.
+- `internal/wagering`: comandos, transações e regras financeiras.
+- `internal/app`: casos de uso e persistência.
+- `internal/httpapi`: API HTTP.
+- `internal/inbound`: consumo de comandos SQS.
+- `internal/outbox`: publicação de eventos.
+- `internal/messaging`: abstração e adaptadores de mensageria.
+- `internal/auth`: validação de tokens.
+- `internal/bootstrap`: composição de dependências e ciclo de vida com Uber Fx.
 
-Cada operação é **uma** transação `READ COMMITTED`: `SELECT ... FOR UPDATE` na linha da carteira →
-consulta de duplicata → decisão → linha de `wager_transactions` → lançamento no ledger → `UPDATE wallets ... WHERE version = n`
-→ eventos no outbox → commit.
+O domínio procura manter as regras financeiras separadas de HTTP, SQL e infraestrutura.
 
-- Coordenação **por carteira** (lock de linha); carteiras diferentes não se bloqueiam (sem lock global).
-- `WHERE version = n` é a segunda barreira contra lost updates; `CHECK (balance >= 0)` é a terceira.
-- Trigger deferido: no commit, `wallets.balance` precisa ser igual ao `balance_after` do último lançamento.
-  Alterar saldo sem lançamento falha no commit, mesmo com SQL manual.
-- Ordem de locks fixa (carteira, depois a linha da transação) → sem deadlock entre API e worker. Deadlock/falha de
-  serialização (`40P01`/`40001`) e violação de unicidade (corrida entre instâncias) repetem a operação até 3 vezes.
-- `SERIALIZABLE` foi descartado: o lock por linha já elimina lost updates com menos retries.
+## 2. Dinheiro
 
-## Idempotência
+- Valores monetários são representados por `int64` em centavos, acompanhados da moeda.
+- A entrada monetária utiliza strings decimais, como `"25.00"`.
+- Não são utilizados números de ponto flutuante para representar valores financeiros.
+- Valores inválidos, escala incorreta e overflow são rejeitados.
+- As operações entre moedas diferentes retornam `ErrCurrencyMismatch`.
+- A persistência utiliza valores inteiros em centavos no PostgreSQL.
+- A moeda é validada pelo formato esperado, não necessariamente contra a lista completa da ISO 4217.
 
-- Persistente: índices únicos parciais em `(provider_id, idempotency_key)` e `(provider_id, external_transaction_id)`.
-  Sobrevive a reinícios e funciona entre instâncias.
-- `Idempotency-Key` é obrigatório (HTTP); no SQS é o campo `idempotencyKey` do corpo. O servidor nunca substitui a chave.
-- **Hash do payload**: SHA-256 (hex) do JSON canônico (chaves ordenadas) de `providerId, externalTransactionId, playerId,
-  walletId, roundId, gameId, kind, money{amount,currency}, referenceExternalTransactionId` (`""` se ausente). Fora do hash:
-  `idempotencyKey`, `correlationId` e metadados de transporte. HTTP e SQS montam o mesmo `Command`, logo o mesmo hash.
-- Mesma chave + mesmo hash → resultado persistido, `idempotentReplay: true`, com o **saldo observado no processamento original**.
-  Mesma chave + hash diferente → `409 IDEMPOTENCY_KEY_CONFLICT`. Mesma operação `(provider, externalId)` com outra
-  chave → `409 EXTERNAL_TRANSACTION_CONFLICT`. Replay de rejeição e de pendência devolve o mesmo estado.
-- A chave é escopada por provedor (`provider_id` faz parte do índice). O provedor vem do token, não do corpo.
+A representação inteira evita erros de arredondamento comuns em cálculos financeiros baseados em ponto flutuante.
 
-## WagerTransaction: estados e códigos
+## 3. Transações SQL e concorrência
 
-`PENDING` (somente em memória: operações sem dependência concluem na mesma transação, sem commit de aceite) →
-`PROCESSED` | `REJECTED` | `PENDING_REFERENCE` → (`PROCESSED` | `REJECTED`). `FAILED` existe no domínio e no schema
-(terminal, falha permanente de infraestrutura), mas **hoje nenhum caminho o grava**: falhas transitórias revertem a
-transação e viram `503`/retry. Estados terminais são imutáveis no domínio **e** por trigger no banco; `DELETE` é bloqueado.
+O processamento financeiro utiliza transações SQL para manter consistentes o saldo, a transação, o ledger e os eventos da Outbox.
 
-| Operação | Movimento | Condição |
+O fluxo geral de uma operação é:
+
+1. Iniciar a transação SQL.
+2. Bloquear a linha da carteira com `SELECT ... FOR UPDATE`.
+3. Verificar operações anteriores e conflitos de idempotência.
+4. Aplicar as regras de negócio.
+5. Persistir a transação financeira.
+6. Registrar o lançamento no ledger quando aplicável.
+7. Atualizar o saldo e a versão da carteira.
+8. Registrar os eventos na Outbox.
+9. Confirmar a transação.
+
+Os detalhes variam conforme o tipo de operação e o estado da transação.
+
+### Proteções de concorrência
+
+- O lock é aplicado por carteira, evitando um lock global que impediria o paralelismo entre carteiras diferentes.
+- A atualização de saldo utiliza a versão da carteira como proteção adicional contra atualizações perdidas.
+- Uma constraint impede que o saldo fique negativo.
+- Constraints e triggers no banco ajudam a preservar a consistência entre saldo e ledger.
+- Falhas de concorrência que podem ser repetidas são tratadas por mecanismos de retry definidos no código.
+
+O PostgreSQL é a fonte de verdade para o estado financeiro. A fila FIFO ajuda a preservar a ordem de processamento, mas não substitui os locks, as constraints ou a idempotência do banco.
+
+## 4. Idempotência financeira
+
+A idempotência financeira impede que a mesma operação seja aplicada duas vezes, mesmo após reentregas, reinícios ou processamento por instâncias diferentes.
+
+A aplicação mantém identificadores persistentes, incluindo:
+
+- `provider_id` e `idempotency_key`;
+- `provider_id` e `external_transaction_id`.
+
+Essas combinações são protegidas por índices únicos no PostgreSQL.
+
+### Chaves e escopo
+
+No HTTP, a chave é recebida pelo cabeçalho `Idempotency-Key`.
+
+No SQS, a chave financeira é informada pelo campo `idempotencyKey` dentro de `data`.
+
+A chave é escopada por provedor. A identidade autorizada do provedor HTTP é obtida do token, e não deve ser confiada ao valor arbitrário enviado no corpo.
+
+### Hash do payload
+
+O hash do payload representa os campos de negócio da operação financeira, incluindo:
+
+- `providerId`;
+- `externalTransactionId`;
+- `playerId`;
+- `walletId`;
+- `roundId`;
+- `gameId`;
+- `kind`;
+- `money.amount`;
+- `money.currency`;
+- `referenceExternalTransactionId`, quando aplicável.
+
+A chave de idempotência, o `correlationId` e os metadados de transporte não fazem parte do hash de negócio.
+
+O HTTP e o SQS devem construir o mesmo comando financeiro para que a mesma operação produza o mesmo hash.
+
+### Comportamento esperado
+
+- Mesma chave e mesmo conteúdo: devolve o resultado persistido, sem repetir o efeito financeiro.
+- Mesma chave e conteúdo diferente: retorna conflito de idempotência.
+- Mesmo identificador externo com outra chave: retorna conflito de transação externa.
+- Repetições de operações rejeitadas ou pendentes devem respeitar o estado persistido da operação original.
+
+A idempotência financeira não é a mesma coisa que a deduplicação de mensagens SQS. Essa distinção é detalhada na seção de mensageria.
+
+## 5. Estados e operações financeiras
+
+Os estados utilizados incluem:
+
+- `PROCESSED`: operação processada.
+- `REJECTED`: operação rejeitada por uma regra de negócio.
+- `PENDING_REFERENCE`: operação aguardando uma transação de referência.
+- `FAILED`: estado existente para falha permanente, mas que não deve ser descrito como utilizado por um caminho de execução se nenhum caminho efetivamente o grava.
+
+Os estados terminais são protegidos pelas regras do domínio e pelas restrições implementadas no banco.
+
+### Operações
+
+| Operação | Movimento financeiro | Regra geral |
 |---|---|---|
-| `BET` | débito | valor > 0, saldo suficiente |
-| `WIN` | crédito | valor > 0; referência opcional (deve ser BET da mesma rodada) |
-| `LOSS` | nenhum | valor exatamente `0.00`; sem ledger nem mudança de versão; emite só `WagerTransactionProcessed` |
-| `REFUND` | crédito | devolve integralmente uma BET processada |
-| `ROLLBACK` | contrário ao original | desfaz integralmente BET (crédito), WIN ou REFUND (débito) |
+| `BET` | Débito | Valor positivo e saldo suficiente |
+| `WIN` | Crédito | Valor positivo; referência opcional conforme as regras do jogo |
+| `LOSS` | Sem movimento | Valor exatamente `0.00`; não gera lançamento financeiro |
+| `REFUND` | Crédito | Devolução integral de uma aposta processada |
+| `ROLLBACK` | Movimento inverso | Desfaz integralmente uma operação elegível |
 
-Referência: resolvida por `(providerId, referenceExternalTransactionId)`; precisa concordar em jogador, carteira, moeda e
-rodada; valor da reversão = valor referenciado (sem reversão parcial).
+Quando uma operação exige referência, ela é resolvida dentro do escopo do provedor. As regras verificam a compatibilidade de jogador, carteira, moeda, rodada e tipo de operação.
 
-**Códigos de rejeição (`failureCode`)** — definitivos, persistidos e com evento: `INSUFFICIENT_FUNDS` (BET sem saldo),
-`REVERSAL_INSUFFICIENT_FUNDS` (reversão que debitaria além do saldo), `WALLET_PLAYER_MISMATCH`, `CURRENCY_MISMATCH`,
-`REFERENCE_NOT_FOUND`, `REFERENCE_NOT_PROCESSED`, `REFERENCE_MISMATCH`, `REFERENCE_KIND_INVALID`,
-`REVERSAL_AMOUNT_MISMATCH`, `ALREADY_REVERSED`. Entradas corrigíveis (JSON, valor, tipo, campos) **não** são persistidas:
-respondem `400`.
+As reversões são integrais, não parciais.
 
-**REFUND × ROLLBACK:** uma transação recebe no máximo **uma** reversão bem-sucedida (REFUND *ou* ROLLBACK), garantido
-por índice único parcial em `reference_transaction_id`. A segunda é `ALREADY_REVERSED`, o que impede devolver o mesmo débito
-duas vezes. Um ROLLBACK pode ter como alvo o próprio REFUND (desfaz o crédito), o que não reabre a BET original.
+### Rejeições de negócio
 
-## Referências pendentes
+As rejeições definitivas podem incluir códigos como:
 
-Se a referência ainda não existe, a operação é persistida como `PENDING_REFERENCE` (`202`, evento
-`WagerTransactionPendingReference`). O worker (qualquer instância) reprocessa com **backoff exponencial**
-(2s, 4s, … teto 5 min), travando a carteira e rechecando o estado antes de agir. Após `PENDING_MAX_ATTEMPTS` (8) tentativas
-sem sucesso → `REJECTED` com `REFERENCE_NOT_FOUND`. Se a referência existe mas ainda está pendente, continua aguardando e, ao
-esgotar, termina `REFERENCE_NOT_PROCESSED`; se a referência terminou `REJECTED`/`FAILED`, rejeita na hora com `REFERENCE_NOT_PROCESSED`.
-Pendências sobrevivem a reinícios (estado no banco).
+- `INSUFFICIENT_FUNDS`;
+- `REVERSAL_INSUFFICIENT_FUNDS`;
+- `WALLET_PLAYER_MISMATCH`;
+- `CURRENCY_MISMATCH`;
+- `REFERENCE_NOT_FOUND`;
+- `REFERENCE_NOT_PROCESSED`;
+- `REFERENCE_MISMATCH`;
+- `REFERENCE_KIND_INVALID`;
+- `REVERSAL_AMOUNT_MISMATCH`;
+- `ALREADY_REVERSED`.
 
-## Ledger, inbox e outbox
+A lista efetiva deve permanecer sincronizada com os códigos definidos no domínio e na API.
 
-- `wallet_ledger_entries`: direção, valor, saldo antes/depois, `CHECK` da aritmética, `UNIQUE (wallet_id, transaction_id)`,
-  triggers que bloqueiam `UPDATE`/`DELETE`/`TRUNCATE`. `LOSS` e rejeições não geram lançamento. Paginação por cursor opaco (`seq`).
-- `outbox_events`: o evento é gravado **na mesma transação** do estado, do saldo e do ledger (envelope com `eventId`,
-  `eventType`, `aggregateId`, `correlationId`, `causationId`, `occurredAt` UTC RFC 3339, `version`, `data`). A abertura de carteira
-  com saldo > 0 cria `OPENING` + crédito + eventos no mesmo commit. O publicador está descrito em "Mensageria".
-- `inbox_messages` (`PRIMARY KEY (consumer_name, message_id)`): linha gravada pelo consumidor SQS **na mesma transação** que altera o
-  saldo (veja "Mensageria").
+Erros de entrada, como JSON inválido ou campos obrigatórios ausentes, são diferentes de rejeições financeiras de negócio.
 
-## Mensageria (SQS)
+### REFUND e ROLLBACK
 
-Duas filas FIFO (cada uma com sua DLQ, criadas pelo app na inicialização, com `RedrivePolicy` de `SQS_MAX_RECEIVE` entregas):
+Uma transação não pode receber duas reversões bem-sucedidas quando as regras do domínio e a constraint correspondente impedem isso.
 
-| Fila | Sentido | `MessageGroupId` | `MessageDeduplicationId` |
+Um `ROLLBACK` pode desfazer uma operação de crédito elegível, inclusive um `REFUND`, sem reabrir automaticamente a operação financeira original que motivou o reembolso.
+
+## 6. Referências pendentes
+
+Quando uma operação depende de uma transação que ainda não existe, ela pode ser persistida como `PENDING_REFERENCE`.
+
+A API pode responder `202 Accepted`, indicando que o processamento ainda não terminou.
+
+O worker de pendências tenta resolver a referência com backoff exponencial, respeitando o número máximo de tentativas configurado.
+
+O processamento reavalia o estado da referência antes de aplicar qualquer movimento financeiro. Isso permite que várias instâncias do serviço compartilhem o trabalho sem depender de estado em memória.
+
+Quando o limite de tentativas é atingido, a operação pode ser rejeitada com um código de falha de referência apropriado.
+
+Como o estado fica persistido no PostgreSQL, a pendência pode sobreviver a reinícios da aplicação.
+
+## 7. Ledger, Inbox e Outbox
+
+### Ledger
+
+A tabela `wallet_ledger_entries` registra os movimentos financeiros, incluindo direção, valor e saldos antes e depois do lançamento.
+
+As restrições do banco ajudam a garantir a consistência aritmética e a unicidade dos lançamentos associados a uma transação.
+
+Os lançamentos são tratados como imutáveis. Operações sem movimento financeiro, como `LOSS`, e rejeições não devem gerar lançamentos de débito ou crédito.
+
+### Outbox
+
+Os eventos são registrados na tabela `outbox_events` dentro da mesma transação SQL que altera o estado financeiro.
+
+O envelope de evento inclui campos como:
+
+- `eventId`;
+- `eventType`;
+- `aggregateId`;
+- `correlationId`;
+- `causationId`;
+- `occurredAt`;
+- `version`;
+- `data`.
+
+O publicador da Outbox envia os eventos depois do commit. Dessa forma, uma falha de publicação não exige reverter uma operação financeira já confirmada.
+
+A publicação é pelo menos uma vez. Por isso, os consumidores de eventos devem deduplicar usando o identificador estável do evento, como `eventId`.
+
+### Inbox
+
+A tabela `inbox_messages` mantém a identidade das mensagens recebidas pelo consumidor SQS.
+
+A chave primária é composta por:
+
+`(consumer_name, message_id)`
+
+A gravação da Inbox ocorre na mesma transação SQL que o processamento financeiro. Isso permite relacionar o registro da mensagem ao resultado da operação.
+
+A Inbox e a idempotência financeira têm finalidades diferentes:
+
+- A Inbox deduplica a mesma mensagem de transporte.
+- A idempotência financeira impede que uma operação financeira seja aplicada novamente, mesmo que chegue em outra mensagem.
+
+## 8. Mensageria SQS
+
+O serviço utiliza duas filas FIFO, cada uma com sua dead-letter queue (DLQ):
+
+| Fila | Direção | `MessageGroupId` | `MessageDeduplicationId` |
 |---|---|---|---|
-| `wager-transactions.fifo` (+ `-dlq`) | provedores/serviços → este serviço (comandos) | `walletId` | `idempotencyKey` (sugerido ao produtor) |
-| `wallet-events.fifo` (+ `-dlq`) | este serviço → consumidores (eventos) | `aggregateId` | `eventId` |
+| `wager-transactions.fifo` | Provedores ou serviços enviam comandos ao Wallet Service | `walletId` | Recomenda-se `idempotencyKey` |
+| `wallet-events.fifo` | Wallet Service publica eventos | `aggregateId` | `eventId` |
 
-**Por que FIFO e esses grupos.** O grupo `walletId` faz a fila entregar as mensagens de uma carteira em ordem e nunca em paralelo
-(enquanto uma está em voo, a próxima do grupo espera), mesmo com várias instâncias consumindo; carteiras diferentes andam em paralelo.
-A ordem não é a única proteção: o lock de linha da carteira e a idempotência continuam valendo, então a correção não depende da fila.
-A deduplicação da fila só cobre 5 minutos; a deduplicação **definitiva** é a da inbox e das chaves de idempotência no PostgreSQL.
+O agrupamento por carteira preserva a ordem de processamento das mensagens daquele grupo e permite paralelismo entre carteiras diferentes.
 
-**Consumidor** (`internal/inbound`). Corpo JSON = o mesmo contrato do HTTP, com a chave no corpo
-(`providerId`, `idempotencyKey`, `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`, `money`,
-`referenceExternalTransactionId`, `correlationId`). Usa o **mesmo** `app.Service.Process` do HTTP (via `ProcessWith`).
-Em uma única transação SQL: `INSERT` na inbox (`consumer_name`, `providerId:idempotencyKey`, hash) → trava da carteira → decisão →
-transação, ledger, saldo e outbox → `completed_at` da inbox → commit. Só depois do commit a mensagem é apagada.
-- Entrega repetida: a inbox acusa a duplicata, nada é reprocessado, a mensagem é apagada (`duplicate`).
-- Queda entre o commit e o delete: a mensagem volta e vira duplicata. Queda antes do commit: tudo é desfeito e a mensagem volta (testado).
-- Falha transitória (banco fora, deadlock): `ChangeMessageVisibility` com backoff exponencial (1s, 2s, 4s… teto 60s). Após
-  `SQS_MAX_RECEIVE` entregas, a **própria fila** move a mensagem para a DLQ.
-- Mensagem inválida (JSON, campos, tipo desconhecido), conflito de idempotência (mesma chave, conteúdo diferente) ou carteira inexistente:
-  vai direto para a DLQ, sem gastar retentativas. Rejeições de negócio (saldo insuficiente etc.) **não** são erro: viram transação `REJECTED` e a mensagem é confirmada.
-- `correlationId`: vem do corpo; se faltar, usa-se o id da mensagem SQS (como o HTTP, que gera um quando o cabeçalho não vem).
-- Se uma mensagem de um grupo falha, as seguintes do mesmo grupo no mesmo lote são devolvidas sem processar (preserva a ordem).
-- Encerramento: para de buscar mensagens, conclui a que está em processamento (limite de 30s) e retorna.
-- `SQS_VISIBILITY_SECONDS` (padrão 60) precisa ser maior que esse limite, para a mensagem não reaparecer enquanto é processada.
+A deduplicação nativa da fila FIFO tem duração limitada. A aplicação continua dependendo da Inbox e da idempotência persistente no PostgreSQL para proteger o processamento financeiro.
 
-**Publicador da outbox** (`internal/outbox`). Publica depois do commit, **pelo menos uma vez**.
-- Reivindica lotes com `FOR UPDATE SKIP LOCKED` e uma concessão (`locked_by`, `locked_until`, 30s). Vários publicadores/instâncias
-  nunca pegam o mesmo evento (testado: 4 publicadores, 200 eventos, exatamente 200 envios).
-- Só o evento **mais antigo não publicado de cada agregado** é elegível: a ordem por agregado vale mesmo com vários publicadores
-  (um evento em backoff segura os seguintes do mesmo agregado).
-- Falha ao publicar: `attempts+1`, `last_error`, `next_attempt_at` com backoff exponencial (1s → teto 60s). Fila fora do ar não derruba o serviço;
-  ao voltar, a outbox drena sozinha (testado).
-- Queda do publicador depois de reivindicar: a concessão expira e outro publica. Queda **depois** de enviar e **antes** de marcar:
-  o evento é republicado com o **mesmo `eventId`**, que também é o `MessageDeduplicationId` (a fila descarta repetições nos 5 minutos seguintes;
-  consumidores devem deduplicar por `eventId`).
-- Eventos: `WagerTransactionProcessed`, `WagerTransactionRejected`, `WagerTransactionPendingReference`, `WalletBalanceChanged`.
+### 8.1. Formato oficial do comando
 
-**Controle de acesso à fila.** A fila de comandos é um canal **confiável**: o serviço aceita o `providerId` que vem na mensagem, sem validar JWT por
-mensagem. Quem pode escrever nela é decidido pelo broker (IAM). Política pretendida na AWS real:
-produtores → `sqs:SendMessage` só em `wager-transactions.fifo`; este serviço → `sqs:ReceiveMessage`, `sqs:DeleteMessage`,
-`sqs:ChangeMessageVisibility`, `sqs:GetQueueAttributes` nela, e `sqs:SendMessage` em `wallet-events.fifo` e nas DLQs; consumidores de eventos → só leitura.
-**No LocalStack do compose essa política não é aplicada** (qualquer credencial funciona): é uma limitação do ambiente local, não uma garantia.
+O corpo da mensagem SQS utiliza um envelope com os seguintes campos:
 
-## Autenticação e autorização
+- `messageId`: identificador estável da mensagem de negócio;
+- `type`: tipo do evento ou comando;
+- `occurredAt`: instante de ocorrência;
+- `data`: conteúdo da operação financeira.
 
-- IdP externo: **Keycloak** (compose, realm `wallet` importado), OAuth 2.0 `client_credentials` entre serviços. Não há cadastro
-  de senhas nem emissão própria de tokens.
-- O serviço valida o JWT **localmente**: assinatura RS256 contra o JWKS do IdP (cache + refresh em `kid` novo), `iss`, `exp`
-  obrigatório (tolerância de 30s); outros algoritmos (inclusive `HS256`/`none`) são recusados. IdP inalcançável → `503`, não `401`.
-- Identidade: o claim `azp` (client id) é o **`providerId` autorizado**. Papéis (realm roles): `wallet-provider` e `wallet-internal`.
-- Matriz: provedor envia e consulta só as próprias transações (o `providerId` do corpo/URL deve ser o do token → senão `403`;
-  transação de outro provedor responde `404`, sem revelar existência; vale também para replays). Operações de carteira
-  (abrir, consultar, ledger, reconciliar) são só do serviço interno. `/health/*` é público. Acessos negados não têm efeito financeiro (testado).
-- Segredos do realm são de **desenvolvimento**. O acesso à fila SQS é controlado pelo broker (veja "Mensageria"); no LocalStack não é aplicado.
+O tipo aceito pelo consumidor é `WagerTransactionRequested`.
 
-## Composição com Uber Fx e shutdown
+Exemplo:
 
-`bootstrap.Module()`: `LoadConfig` (valida; sem `OIDC_*` a app não sobe) → `newDB` (ping na partida; `Close` na parada) → `Service` (com observador de métricas) →
-verificador de JWT → API → `Invoke(startWorker, startMessaging, startServer)`. Início: falha se o PostgreSQL estiver inalcançável, a porta ocupada
-ou o SQS não responder dentro do prazo de partida (30s; o app tenta provisionar as filas de novo a cada 2s). Parada (ordem inversa): o servidor deixa de
-aceitar conexões e conclui as requisições em andamento; o consumidor SQS e o publicador da outbox concluem o que estão fazendo; o worker de pendências é
-cancelado e **aguardado**; só então o pool do banco fecha. `MESSAGING_ENABLED=false` desliga a mensageria (usado nos testes de ciclo de vida do Fx).
+```json
+{
+  "messageId": "msg-456",
+  "type": "WagerTransactionRequested",
+  "occurredAt": "2026-09-18T12:00:00.000Z",
+  "data": {
+    "providerId": "provider-a",
+    "externalTransactionId": "transaction-456",
+    "idempotencyKey": "provider-a:transaction-456",
+    "playerId": "PLAYER_ID",
+    "walletId": "WALLET_ID",
+    "roundId": "round-987",
+    "gameId": "fortune-chimp",
+    "kind": "BET",
+    "money": {
+      "amount": "25.00",
+      "currency": "BRL"
+    }
+  }
+}
+```
 
-## Observabilidade
+Os identificadores de jogador e carteira do exemplo são ilustrativos e precisam ser substituídos por identificadores existentes no ambiente.
 
-Logs JSON (`slog`) com `correlationId` (cabeçalho `X-Correlation-Id` ou gerado, ecoado e persistido; nas mensagens SQS vem do corpo),
-`transactionId`, `walletId`, `providerId`; sem credenciais nem payload completo. Health: `live` e `ready` (PostgreSQL + as duas filas).
+O objeto `data` também pode incluir campos como `referenceExternalTransactionId` e `correlationId`, quando aplicáveis.
 
-`GET /metrics` (formato Prometheus, sem autenticação, como `/health/*`; em produção restrinja por rede):
+### 8.2. Identidade da mensagem e deduplicação da Inbox
 
-| Métrica | Significado |
+O consumidor utiliza o `messageId` do envelope como identidade persistente da mensagem.
+
+A chave da Inbox é:
+
+`(consumer_name, message_id)`
+
+O `MessageDeduplicationId` do SQS não substitui o `messageId` do envelope. São identificadores utilizados em camadas diferentes.
+
+O fluxo de processamento é:
+
+1. Receber a mensagem SQS.
+2. Decodificar e validar o envelope.
+3. Validar o tipo de comando e os dados necessários.
+4. Iniciar o processamento financeiro transacional.
+5. Registrar a identidade da mensagem na Inbox.
+6. Processar a operação financeira.
+7. Persistir transação, saldo, ledger e eventos da Outbox, quando aplicáveis.
+8. Marcar a mensagem como concluída na Inbox.
+9. Confirmar a transação SQL.
+10. Remover a mensagem da fila depois do commit.
+
+A identidade da Inbox e o resultado financeiro precisam ser persistidos de maneira atômica. Se ocorrer uma falha antes do commit, as alterações da transação devem ser revertidas.
+
+### 8.3. Cenários de reentrega
+
+**Mesmo `messageId` no envelope**
+
+A Inbox reconhece que a mensagem já foi processada e evita repetir o processamento financeiro.
+
+**`messageId` diferente, mesma operação financeira**
+
+A Inbox considera a mensagem nova. A idempotência financeira persistida no PostgreSQL deve impedir um segundo débito quando a chave e o conteúdo representam a mesma operação.
+
+**Falha antes do commit**
+
+A transação SQL é revertida. A mensagem pode ser entregue novamente e processada.
+
+**Falha depois do commit, antes de remover a mensagem**
+
+A mensagem pode ser entregue novamente. A Inbox reconhece o identificador já concluído e impede o reprocessamento financeiro.
+
+**Deduplicação FIFO**
+
+O SQS pode descartar mensagens repetidas com o mesmo `MessageDeduplicationId` durante a janela de deduplicação da fila. Esse comportamento não deve ser usado como única proteção contra duplicidade financeira.
+
+### 8.4. Falhas e DLQ
+
+Falhas transitórias podem resultar em nova tentativa de processamento, com ajuste da visibilidade da mensagem e backoff.
+
+Mensagens inválidas ou incompatíveis com o contrato podem ser encaminhadas para a DLQ conforme o comportamento implementado pelo consumidor.
+
+Rejeições de negócio, como saldo insuficiente, não devem ser confundidas com falhas técnicas. Quando a rejeição é persistida como resultado da operação, a mensagem pode ser confirmada sem repetir indefinidamente o mesmo comando.
+
+O comportamento exato para conflitos de idempotência, carteira inexistente, erros de banco e falhas de infraestrutura deve ser validado nos testes do consumidor.
+
+### 8.5. Publicador da Outbox
+
+O publicador envia eventos persistidos na Outbox para a fila de eventos.
+
+A publicação utiliza mecanismos de concorrência no banco, como `FOR UPDATE SKIP LOCKED`, e concessões temporárias para evitar que vários publicadores processem simultaneamente o mesmo registro.
+
+O publicador deve preservar a ordem dos eventos de um mesmo agregado, conforme as regras implementadas.
+
+Se ocorrer uma falha após o envio à fila, mas antes da marcação do evento como publicado no banco, o evento poderá ser enviado novamente. O identificador do evento deve permanecer estável para permitir deduplicação pelos consumidores.
+
+### 8.6. Controle de acesso às filas
+
+A fila de comandos é tratada como um canal confiável. O serviço não deve presumir que o conteúdo de uma mensagem SQS passou pela autenticação HTTP.
+
+Em um ambiente AWS real, o acesso às filas deve ser restringido por IAM, limitando quais produtores podem enviar comandos e quais serviços podem consumir mensagens ou publicar eventos.
+
+Se o ambiente LocalStack não aplicar as mesmas políticas de IAM da AWS, isso deve ser tratado como uma limitação do ambiente de desenvolvimento, não como uma garantia de segurança em produção.
+
+## 9. Autenticação e autorização
+
+O serviço utiliza Keycloak como provedor de identidade. A aplicação valida os JWTs localmente com base nas chaves públicas publicadas pelo JWKS.
+
+Os principais elementos são:
+
+- Validação da assinatura do token.
+- Validação do emissor `iss`.
+- Verificação da expiração `exp`.
+- Identificação do cliente autorizado.
+- Verificação dos papéis necessários para cada operação.
+
+O cliente identificado pelo token determina o `providerId` autorizado nas chamadas dos provedores.
+
+### Regras de acesso
+
+- Provedores podem enviar e consultar apenas as próprias transações.
+- O serviço interno pode executar as operações administrativas de carteira.
+- Endpoints de saúde são públicos.
+- Uma solicitação sem permissão não deve produzir efeitos financeiros.
+- Os segredos usados no realm de desenvolvimento não devem ser reutilizados em produção.
+
+A validação de audiência (`aud`), introspecção, revogação e rotação de segredos deve ser descrita como implementada apenas se houver suporte efetivo no código.
+
+## 10. Composição e encerramento
+
+O aplicativo utiliza Uber Fx para compor as dependências e gerenciar o ciclo de vida.
+
+A inicialização inclui a leitura da configuração, a conexão com o banco, a construção dos serviços, o verificador de tokens e o servidor HTTP, além dos workers e componentes de mensageria habilitados.
+
+O encerramento gracioso deve interromper a entrada de novos trabalhos, permitir a conclusão dos trabalhos em andamento dentro dos limites definidos e fechar os recursos na ordem apropriada.
+
+A variável `MESSAGING_ENABLED` permite desabilitar os componentes de mensageria quando isso for necessário, conforme a configuração implementada.
+
+## 11. Observabilidade
+
+A aplicação utiliza logs estruturados e métricas no formato Prometheus.
+
+Os logs podem incluir identificadores de correlação e de transação para facilitar o rastreamento de uma operação entre componentes. Credenciais e payloads sensíveis não devem ser registrados integralmente.
+
+Endpoints de saúde:
+
+- `/health/live`: indica se o processo está ativo.
+- `/health/ready`: indica se as dependências necessárias estão disponíveis.
+
+O endpoint `/metrics` expõe as métricas configuradas no serviço.
+
+Entre as categorias documentadas estão:
+
+| Métrica | Finalidade |
 |---|---|
-| `wallet_wager_results_total{source,kind,status}` | resultados por origem (`http`/`sqs`), tipo e status (`PROCESSED`, `REJECTED`, `PENDING_REFERENCE`, `ERROR`) |
-| `wallet_wager_duplicates_total{source}` | repetições respondidas sem reprocessar |
-| `wallet_wager_duration_seconds{source}` | histograma de latência |
-| `wallet_concurrency_conflicts_total` | tentativas repetidas por deadlock/serialização/unicidade concorrente |
-| `wallet_pending_retries_total` | retentativas de referências pendentes |
-| `wallet_sqs_messages_total{result}` | `acked`, `duplicate`, `retried`, `dead_lettered` |
-| `wallet_sqs_dlq_total` | mensagens que o consumidor enviou à DLQ (veneno) |
-| `wallet_outbox_published_total` / `wallet_outbox_publish_failures_total` | publicação da outbox |
-| `wallet_outbox_lag_seconds`, `wallet_outbox_unpublished` | idade do evento mais antigo e quantidade não publicada (−1 se o banco não respondeu) |
-| `wallet_reconciliation_divergences_total` | divergências entre saldo e ledger |
+| `wallet_wager_results_total` | Contabilizar resultados das operações |
+| `wallet_wager_duplicates_total` | Contabilizar duplicatas reconhecidas |
+| `wallet_wager_duration_seconds` | Medir a duração do processamento |
+| `wallet_concurrency_conflicts_total` | Contabilizar conflitos de concorrência |
+| `wallet_pending_retries_total` | Contabilizar tentativas de resolução de referências |
+| `wallet_sqs_messages_total` | Contabilizar resultados do consumo SQS |
+| `wallet_sqs_dlq_total` | Contabilizar mensagens encaminhadas à DLQ pela aplicação |
+| `wallet_outbox_published_total` | Contabilizar eventos publicados |
+| `wallet_outbox_publish_failures_total` | Contabilizar falhas de publicação |
+| `wallet_outbox_lag_seconds` | Medir a idade dos eventos pendentes |
+| `wallet_outbox_unpublished` | Contabilizar eventos ainda não publicados |
+| `wallet_reconciliation_divergences_total` | Contabilizar divergências identificadas pela reconciliação |
 
-Limite conhecido: mensagens movidas para a DLQ pelo *redrive* da própria fila (após `SQS_MAX_RECEIVE` falhas) acontecem dentro do SQS e **não**
-são contadas por este serviço; o que o serviço vê é cada `retried`. Divergência de reconciliação também vai para o log.
+As métricas reais disponíveis devem ser verificadas no código. Mensagens movidas para a DLQ diretamente pelo redrive do SQS podem não ser contabilizadas como encaminhamentos realizados pela aplicação.
 
-## Códigos HTTP
+Em produção, o acesso a métricas e endpoints operacionais deve ser restringido conforme as necessidades de segurança do ambiente.
 
-| Situação | HTTP | `error.code` / corpo |
-|---|---|---|
-| Processada / replay | 200 | `status: PROCESSED`, `idempotentReplay` |
-| Aguardando referência | 202 | `status: PENDING_REFERENCE`, `nextAttemptAt` |
-| Carteira criada | 201 | `{id, playerId, balance, version}` |
-| Entrada inválida | 400 | `INVALID_REQUEST`, `MISSING_IDEMPOTENCY_KEY` |
-| Sem/Token inválido | 401 | `UNAUTHORIZED` (+ `WWW-Authenticate`) |
-| Sem permissão / provedor diferente | 403 | `FORBIDDEN`, `PROVIDER_MISMATCH` |
-| Não encontrado | 404 | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND` |
-| Conflito | 409 | `IDEMPOTENCY_KEY_CONFLICT`, `EXTERNAL_TRANSACTION_CONFLICT`, `WALLET_ALREADY_EXISTS` |
-| Rejeição de negócio | 422 | `status: REJECTED`, `failureCode` |
-| PostgreSQL/IdP indisponível | 503 | `SERVICE_UNAVAILABLE`, `IDENTITY_PROVIDER_UNAVAILABLE` (+ `Retry-After`) |
+## 12. Códigos HTTP
 
-## Interpretações e limitações
+A tabela a seguir resume os códigos documentados para a API. O comportamento efetivo deve permanecer sincronizado com os handlers.
 
-- `go.mod` declara `go 1.27.2` (a versão usada no desenvolvimento); o Dockerfile usa `golang:1.27-alpine`.
-- A corrida entre três **processos do SO** está automatizada (`multiprocess_integration_test.go`); os demais testes de concorrência usam várias instâncias de `Service` com pools próprios no mesmo processo.
-- Contra o Keycloak real há um teste (`-tags keycloak`) e o fluxo do README, mas ambos dependem de subir o compose.
-- O `docker compose` completo (Keycloak com hostname fixo `localhost:8081`, LocalStack) não foi executado no ambiente em que o código foi escrito; lá só rodaram os testes (PostgreSQL real, filas em memória). A execução do compose é verificada na máquina do autor.
-- Os testes de mensageria usam uma fila em memória com a mesma semântica relevante do SQS FIFO (grupo, visibilidade, contagem de entregas, deduplicação, DLQ). Os testes com `-tags localstack` (`internal/inbound/sqs_localstack_test.go`) exercitam o adaptador do SDK, o consumidor e o publicador contra um SQS real; eles exigem o LocalStack no ar e não foram executados no ambiente em que o código foi escrito (sem Docker).
-- Validação de `aud`, introspecção/revogação de token e rotação de segredos não foram implementadas.
+| Situação | HTTP | Exemplo de código ou resultado |
+|---|---:|---|
+| Operação processada ou replay | `200` | `PROCESSED` |
+| Operação aguardando referência | `202` | `PENDING_REFERENCE` |
+| Carteira criada | `201` | Dados da carteira |
+| Entrada inválida | `400` | `INVALID_REQUEST` |
+| Token ausente ou inválido | `401` | `UNAUTHORIZED` |
+| Acesso não autorizado | `403` | `FORBIDDEN`, `PROVIDER_MISMATCH` |
+| Recurso não encontrado | `404` | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND` |
+| Conflito de idempotência ou transação | `409` | `IDEMPOTENCY_KEY_CONFLICT`, `EXTERNAL_TRANSACTION_CONFLICT` |
+| Rejeição de negócio | `422` | `REJECTED` e `failureCode` |
+| Dependência indisponível | `503` | `SERVICE_UNAVAILABLE` |
 
-## Não implementado
+Os códigos de erro específicos e seus corpos de resposta devem ser confirmados no contrato da API antes de serem considerados definitivos.
 
-| Requisito | Situação |
+## 13. Limitações conhecidas e itens não implementados
+
+Os itens abaixo devem ser mantidos sincronizados com o código atual e com os testes realmente executados.
+
+| Item | Situação documentada |
 |---|---|
-| `FAILED` gravado por algum caminho | Estado existe; sem uso (falhas técnicas voltam como erro e são retentadas) |
-| Validação de `aud`, introspecção/revogação de token | Não implementado |
-| Política IAM do SQS **aplicada** | Documentada; o LocalStack do compose não a aplica |
-| Execução contra a AWS real | Não testada; só LocalStack (e filas em memória nos testes) |
-| Tracing OpenTelemetry, partidas dobradas, testes de carga | Opcionais; não feitos |
+| Estado `FAILED` | Existe no domínio/schema, mas não deve ser descrito como gravado por um fluxo de execução sem evidência no código |
+| Validação de audiência `aud` | Não implementada, conforme a documentação atual |
+| Introspecção ou revogação de tokens | Não implementadas, conforme a documentação atual |
+| Política IAM do SQS | Deve ser aplicada e validada no ambiente AWS real |
+| Execução contra AWS real | Não deve ser considerada validada apenas por testes com LocalStack |
+| OpenTelemetry | Não implementado, conforme a documentação atual |
+| Ledger de partidas dobradas | Não implementado, conforme a documentação atual |
+| Testes de carga | Não implementados, conforme a documentação atual |
+
+## 14. Validação do ambiente
+
+A documentação fornece comandos para executar os testes, mas a conclusão de que o projeto funciona integralmente em um ambiente depende da execução efetiva.
+
+Para uma validação local, recomenda-se verificar:
+
+1. Se o Docker Compose consegue resolver a configuração.
+2. Se PostgreSQL, migrations, Keycloak e LocalStack iniciam corretamente.
+3. Se a API fica disponível e os endpoints de saúde retornam os estados esperados.
+4. Se a autenticação funciona com os clientes de desenvolvimento.
+5. Se as operações financeiras respeitam saldo, regras de negócio e idempotência.
+6. Se o consumidor processa o envelope oficial SQS.
+7. Se a Inbox impede reprocessamento após uma reentrega.
+8. Se a Outbox publica os eventos persistidos.
+9. Se os testes de integração, os testes com Keycloak e os testes com LocalStack passam nos ambientes correspondentes.
+10. Se as limitações documentadas continuam refletindo o código.
+
+A validação contra PostgreSQL, LocalStack e Keycloak deve ser diferenciada da validação contra serviços AWS reais.
+
+## 15. Referências internas
+
+Os principais componentes relacionados às decisões descritas neste documento são:
+
+- `internal/money`: representação monetária.
+- `internal/wallet`: carteira e ledger.
+- `internal/wagering`: regras de negócio das transações.
+- `internal/app`: processamento e persistência.
+- `internal/inbound`: consumidor SQS e Inbox.
+- `internal/outbox`: publicação de eventos.
+- `internal/messaging`: abstração de filas e adaptadores.
+- `internal/auth`: autenticação e validação de JWT.
+- `internal/httpapi`: endpoints HTTP.
+- `internal/bootstrap`: inicialização e encerramento.
+- `db/migrations`: constraints, índices, triggers e tabelas do banco.
+
+Esses componentes, junto com os testes automatizados, são a referência para confirmar o comportamento real do serviço.
