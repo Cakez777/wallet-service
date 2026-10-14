@@ -84,7 +84,7 @@ go tool cover -func=cover.out
 go tool cover -html=cover.out -o cover.html
 ```
 
-- Cobertura total combinada: **78,7 %** das instruções.
+- Cobertura total combinada: **72,5 %** das instruções, medida com as tags integration, keycloak e localstack e -race (Windows, PostgreSQL/Keycloak/LocalStack do Compose).
 - Os `0 %` restantes são, em geral, código exercitado apenas por outras tags: adaptador SQS (`messaging/sqs.go`, `bootstrap/messaging.go`, `outbox.Run`) é coberto pelos testes `-tags localstack`; `WithLeeway` e a verificação do Keycloak, por `-tags keycloak`; `main()` não tem teste.
 - Para o número completo na sua máquina, inclua as tags: `go test -tags "integration keycloak localstack" -race -coverpkg=./... -coverprofile=cover.out ./...` (com os serviços do Compose no ar).
 - Itens relevantes que estavam em 0 % e agora têm teste: `app.IsTransient` (classificação de falhas transitórias) e os contadores do observador de métricas.
