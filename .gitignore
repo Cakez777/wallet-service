@@ -1,3 +1,9 @@
 bin/
 *.exe
 .env
+
+coverage/
+coverage*.html
+coverage*.out
+cover.out
+cover.html
