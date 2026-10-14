@@ -45,6 +45,7 @@ func (c *counts) get(r string) int {
 
 type fixture struct {
 	t     *testing.T
+	dsn   string
 	db    *sql.DB
 	svc   *app.Service
 	q     *messaging.Memory
@@ -74,6 +75,7 @@ func newFixture(t *testing.T, balance string, maxReceive int) *fixture {
 
 	return &fixture{
 		t:     t,
+		dsn:   dsn,
 		db:    db,
 		svc:   svc,
 		q:     q,

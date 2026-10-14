@@ -90,6 +90,34 @@
           }
         }
       ]
+    },
+    {
+      "clientId": "provider-short-lived",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "short-lived-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "protocolMappers": [
+        {
+          "name": "wallet-service-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "wallet-service",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ],
+      "attributes": {
+        "access.token.lifespan": "3"
+      }
     }
   ],
   "users": [
@@ -115,6 +143,14 @@
       "serviceAccountClientId": "wallet-internal-service",
       "realmRoles": [
         "wallet-internal"
+      ]
+    },
+    {
+      "username": "service-account-provider-short-lived",
+      "enabled": true,
+      "serviceAccountClientId": "provider-short-lived",
+      "realmRoles": [
+        "wallet-provider"
       ]
     }
   ]

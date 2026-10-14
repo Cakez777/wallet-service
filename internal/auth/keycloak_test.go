@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Teste contra o Keycloak real do docker-compose (realm "wallet" importado de deploy/keycloak).
@@ -80,5 +81,25 @@ func TestKeycloakTokens(t *testing.T) {
 	tok, _ := clientCredentials(t, "provider-a", "provider-a-secret")
 	if _, err := other.Verify(ctx, tok); !errors.Is(err, ErrUnauthenticated) {
 		t.Errorf("emissor diferente deveria ser rejeitado, veio %v", err)
+	}
+}
+
+// Token realmente emitido pelo Keycloak com validade curta (cliente provider-short-lived, 3 s):
+// válido logo após a emissão e rejeitado depois de expirar. O leeway é zerado para o teste ser
+// determinístico (em produção a tolerância padrão é de 30 s).
+func TestKeycloakExpiredToken(t *testing.T) {
+	v := NewVerifier(kcBase()+"/realms/wallet", kcBase()+"/realms/wallet/protocol/openid-connect/certs").WithLeeway(0)
+	ctx := context.Background()
+
+	tok, status := clientCredentials(t, "provider-short-lived", "short-lived-secret")
+	if status != 200 || tok == "" {
+		t.Fatalf("token não emitido (HTTP %d); reimporte o realm: docker compose down -v && docker compose up -d", status)
+	}
+	if _, err := v.Verify(ctx, tok); err != nil {
+		t.Fatalf("token recém-emitido deveria ser válido: %v", err)
+	}
+	time.Sleep(4 * time.Second)
+	if _, err := v.Verify(ctx, tok); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("token expirado deveria ser rejeitado como não autenticado, veio %v", err)
 	}
 }

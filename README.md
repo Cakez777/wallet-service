@@ -463,13 +463,15 @@ deploy/
 
 ## Decisões importantes
 
-- **Dinheiro:** valores monetários são representados em centavos inteiros, evitando erros de ponto flutuante.
-- **Concorrência:** o PostgreSQL coordena as alterações de saldo por meio de transações e locks.
-- **Idempotência:** as chaves são persistidas no banco e continuam válidas após reinícios.
-- **Ledger:** os lançamentos financeiros são imutáveis.
-- **Inbox:** impede o reprocessamento de mensagens SQS já consumidas com o mesmo identificador de envelope.
-- **Outbox:** os eventos são persistidos na mesma transação das alterações financeiras e publicados posteriormente.
-- **Autenticação:** os tokens são emitidos pelo Keycloak e validados pela aplicação.
-- **Mensageria:** o SQS utiliza filas FIFO, com DLQs para mensagens que não podem ser processadas.
+- **Dinheiro:** `int64` em centavos + moeda; entrada só no formato `0.00` (sem arredondar), `BIGINT` no banco, nenhum `float` envolvido.
+- **Concorrência:** `SELECT ... FOR UPDATE` na carteira (READ COMMITTED) + versão esperada no `UPDATE` + `CHECK balance >= 0` + trigger que amarra o saldo ao ledger. Sem lock global; funciona com várias instâncias (testado com 3 processos reais).
+- **Idempotência:** índices únicos parciais no PostgreSQL (`providerId + idempotencyKey` e `providerId + externalTransactionId`) e hash SHA-256 do payload canônico; o replay devolve o resultado original e o conflito dá `409`.
+- **Ledger:** imutável (triggers impedem `UPDATE`/`DELETE`/`TRUNCATE`); a reconciliação compara saldo e ledger no mesmo snapshot.
+- **Inbox:** `(consumer, messageId do envelope)` gravada na mesma transação do efeito financeiro; a mensagem só é apagada do SQS depois do commit.
+- **Outbox:** eventos gravados na mesma transação e publicados por worker separado (lease + `SKIP LOCKED`, ordem por agregado, backoff, mesmo `eventId` ao republicar).
+- **Referências pendentes:** `REFUND`/`ROLLBACK` sem referência ficam `PENDING_REFERENCE` (HTTP `202`) e são retomados com backoff por qualquer instância; ao esgotar, viram `REJECTED`.
+- **Autenticação:** tokens do Keycloak (`client_credentials`) validados localmente (JWKS, RS256, `iss`, `aud`, `exp`); o `azp` do token é o `providerId` autorizado.
+- **Mensageria:** filas FIFO (grupo = carteira) com DLQ; mensagens inválidas vão direto à DLQ, falhas transitórias voltam com backoff.
+- **Limitações conhecidas:** `FAILED` existe mas não é gravado, IAM do SQS não é aplicado no LocalStack, AWS real e testes de carga não foram feitos (detalhes na seção 14 do ARCHITECTURE.md).
 
 Para detalhes sobre o fluxo transacional, os estados das operações, os códigos HTTP e as limitações conhecidas, consulte [ARCHITECTURE.md](ARCHITECTURE.md).

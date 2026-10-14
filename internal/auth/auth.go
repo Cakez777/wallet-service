@@ -74,6 +74,7 @@ type Verifier struct {
 	jwksURL    string
 	client     *http.Client
 	minRefresh time.Duration
+	leeway     time.Duration
 
 	mu        sync.RWMutex
 	keys      map[string]*rsa.PublicKey
@@ -90,8 +91,15 @@ func NewVerifier(issuer, jwksURL string) *Verifier {
 		jwksURL:    jwksURL,
 		client:     &http.Client{Timeout: 5 * time.Second},
 		minRefresh: 10 * time.Second,
+		leeway:     30 * time.Second,
 		keys:       map[string]*rsa.PublicKey{},
 	}
+}
+
+// WithLeeway ajusta a tolerância de relógio para exp/nbf (padrão 30 s) e devolve o próprio verificador.
+func (v *Verifier) WithLeeway(d time.Duration) *Verifier {
+	v.leeway = d
+	return v
 }
 
 // Verify valida o token e devolve a identidade autenticada.
@@ -112,7 +120,7 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (Principal, error) {
 		jwt.WithIssuer(v.issuer),
 		jwt.WithAudience(ExpectedAudience),
 		jwt.WithExpirationRequired(),
-		jwt.WithLeeway(30*time.Second),
+		jwt.WithLeeway(v.leeway),
 	)
 
 	if err != nil {
