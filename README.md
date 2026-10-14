@@ -133,6 +133,10 @@ O Compose importa o realm `wallet` no Keycloak (`http://localhost:8081`). Os cli
 | `provider-b` | `provider-b-secret` | `wallet-provider` | Simula o provedor B |
 | `wallet-internal-service` | `internal-secret` | `wallet-internal` | Operações internas de carteira |
 
+| `provider-short-lived` | `short-lived-secret` | `wallet-provider` | Token de 3 s de validade, usado só no teste de token expirado |
+
+**Provisionamento automático:** o realm, os clientes, os papéis e as contas de serviço estão em `deploy/keycloak/realm-wallet.json` e são importados pelo Keycloak na inicialização do Compose; não há passo manual. Se o realm mudar, recrie o volume (`docker compose down -v`, apaga os dados locais) para reimportá-lo.
+
 Esses valores pertencem exclusivamente ao ambiente local. Não publique nem reutilize segredos reais.
 
 ### Obter token com PowerShell
@@ -191,6 +195,67 @@ curl -X POST 'http://localhost:8080/wagering/transactions' \
 ```
 
 O valor monetário é uma string decimal com exatamente duas casas. `BET`, `WIN`, `REFUND` e `ROLLBACK` exigem valor positivo; `LOSS` exige `0.00` e não movimenta saldo. As regras de referência e reversão estão em [`ARCHITECTURE.md`](ARCHITECTURE.md#regras-de-domínio-e-estados).
+
+### Fluxo autenticado completo no PowerShell (Windows)
+
+No PowerShell, `curl` é um apelido de outro comando; use os comandos abaixo (ou `curl.exe`). Com a pilha no ar (`docker compose up --build -d`):
+
+```powershell
+# Tokens: serviço interno (carteiras) e provedor A (operações)
+$tokenUrl = 'http://localhost:8081/realms/wallet/protocol/openid-connect/token'
+$int  = (Invoke-RestMethod -Method Post -Uri $tokenUrl -Body @{ grant_type='client_credentials'; client_id='wallet-internal-service'; client_secret='internal-secret' }).access_token
+$prov = (Invoke-RestMethod -Method Post -Uri $tokenUrl -Body @{ grant_type='client_credentials'; client_id='provider-a'; client_secret='provider-a-secret' }).access_token
+
+# Carteira com 100.00 BRL
+$playerId = [guid]::NewGuid().ToString()
+$wallet = Invoke-RestMethod -Method Post -Uri 'http://localhost:8080/wallets' `
+  -Headers @{ Authorization = "Bearer $int" } -ContentType 'application/json' `
+  -Body (@{ playerId=$playerId; initialBalance=@{ amount='100.00'; currency='BRL' } } | ConvertTo-Json)
+
+# BET de 25.00 (repita o último comando para ver idempotentReplay = true)
+$bet = @{ providerId='provider-a'; externalTransactionId='tx-1'; playerId=$playerId; walletId=$wallet.id
+          roundId='round-1'; gameId='fortune-chimp'; kind='BET'; money=@{ amount='25.00'; currency='BRL' } } | ConvertTo-Json
+$h = @{ Authorization = "Bearer $prov"; 'Idempotency-Key' = 'provider-a:tx-1' }
+Invoke-RestMethod -Method Post -Uri 'http://localhost:8080/wagering/transactions' -Headers $h -ContentType 'application/json' -Body $bet
+
+# Saldo, ledger e reconciliação (somente serviço interno)
+$ih = @{ Authorization = "Bearer $int" }
+(Invoke-RestMethod -Uri "http://localhost:8080/wallets/$($wallet.id)" -Headers $ih).balance
+Invoke-RestMethod -Uri "http://localhost:8080/wallets/$($wallet.id)/ledger?limit=50" -Headers $ih
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/wallets/$($wallet.id)/reconciliation" -Headers $ih
+```
+
+Resultados esperados: saldo `75.00` após a aposta, `idempotentReplay: true` na repetição, e reconciliação com `consistent: true`. Verificações de autorização:
+
+```powershell
+# Token de provedor não cria carteira: 403 Forbidden
+try { Invoke-RestMethod -Method Post -Uri 'http://localhost:8080/wallets' -Headers @{ Authorization = "Bearer $prov" } -ContentType 'application/json' -Body (@{ playerId=[guid]::NewGuid().ToString(); initialBalance=@{ amount='1.00'; currency='BRL' } } | ConvertTo-Json) } catch { $_.Exception.Response.StatusCode }
+# Sem token: 401 Unauthorized
+try { Invoke-RestMethod -Uri "http://localhost:8080/wallets/$($wallet.id)" } catch { $_.Exception.Response.StatusCode }
+```
+
+Para uma reversão, envie `kind` `REFUND` ou `ROLLBACK` com `referenceExternalTransactionId` apontando para a transação original; se ela ainda não existir, a resposta é `202` com `PENDING_REFERENCE` e o serviço retoma a operação quando a referência chegar.
+
+### Enviar uma operação pelo SQS (LocalStack)
+
+A mesma operação pode entrar pela fila de comandos. O corpo segue o envelope oficial; `data.idempotencyKey` é a chave de idempotência. Continuando o fluxo acima:
+
+```powershell
+@"
+{"messageId":"msg-1","type":"WagerTransactionRequested","occurredAt":"2026-10-14T12:00:00.000Z","data":{"providerId":"provider-a","externalTransactionId":"tx-sqs-1","idempotencyKey":"provider-a:tx-sqs-1","playerId":"$playerId","walletId":"$($wallet.id)","roundId":"round-2","gameId":"fortune-chimp","kind":"BET","money":{"amount":"10.00","currency":"BRL"}}}
+"@ | Set-Content -Encoding ascii msg.json
+docker cp msg.json wallet_localstack:/tmp/msg.json
+docker exec wallet_localstack awslocal sqs send-message --queue-url http://localhost:4566/000000000000/wager-transactions.fifo --message-group-id $wallet.id --message-deduplication-id sqs-key-1 --message-body file:///tmp/msg.json
+Start-Sleep -Seconds 3
+(Invoke-RestMethod -Uri "http://localhost:8080/wallets/$($wallet.id)" -Headers $ih).balance    # 65.00
+Remove-Item msg.json
+```
+
+Reenviar a mesma mensagem (com outro `--message-deduplication-id`) não debita de novo: a inbox a reconhece e o contador `wallet_sqs_messages_total{result="duplicate"}` em `/metrics` aumenta. Os eventos publicados ficam em `wallet-events.fifo`:
+
+```powershell
+docker exec wallet_localstack awslocal sqs receive-message --queue-url http://localhost:4566/000000000000/wallet-events.fifo --max-number-of-messages 10
+```
 
 ## Endpoints
 
@@ -287,6 +352,59 @@ go test -tags localstack -race -count=1 -v ./internal/inbound/
 ```
 
 O teste `TestSQSDeleteFailureAfterCommitIsHarmless` simula a falha inicial de exclusão **depois do commit**, usando o SQS do LocalStack para a entrega e reentrega. O teste valida que a Inbox reconhece a mensagem repetida e impede um segundo débito.
+
+### Formatação e todos os testes de uma vez
+
+```bash
+gofmt -l .        # não deve listar nenhum arquivo
+go vet ./...
+```
+
+Com PostgreSQL, Keycloak e LocalStack no ar (`docker compose up -d postgres keycloak localstack`) e `TEST_DATABASE_URL` definida, todas as camadas, com cobertura combinada (no PowerShell, mantenha as aspas em `"-coverprofile=cover.out"`):
+
+```powershell
+go test -tags "integration keycloak localstack" -race -count=1 -coverpkg=./... "-coverprofile=cover.out" ./...
+go tool cover "-func=cover.out" | Select-Object -Last 1
+```
+
+Se o realm do Keycloak mudou desde a última execução, recrie o volume (`docker compose down -v`) antes de subir os serviços, para que o cliente `provider-short-lived` exista.
+
+### Preparar as dependências dos testes
+
+| Camada | Tag | Precisa de | Variável |
+|---|---|---|---|
+| Unitários | nenhuma | apenas Go | — |
+| Integração (PostgreSQL real, fila em memória) | `integration` | `docker compose up -d postgres` | `TEST_DATABASE_URL` |
+| IdP real | `keycloak` | `docker compose up -d keycloak` | `KEYCLOAK_URL` (padrão `http://localhost:8081`) |
+| SQS real | `localstack` | `docker compose up -d postgres localstack` | `TEST_DATABASE_URL` |
+
+Cada teste de integração cria um banco temporário no servidor apontado por `TEST_DATABASE_URL`, aplica as migrations e o remove ao final; portanto os testes não alteram o banco da aplicação.
+
+### Múltiplas instâncias e simulações de falha
+
+Cenários executáveis individualmente (com `-tags integration`, ou `-tags localstack` onde indicado):
+
+| Cenário | Comando |
+|---|---|
+| 3 processos do sistema operacional disputam a mesma carteira (100.00 com duas apostas de 80.00; mesma aposta enviada pelos 3) | `go test -tags integration -race -count=1 -run "TestThreeProcesses" -v ./internal/app/` |
+| Mesma aposta 50 vezes em paralelo; duas apostas de 80.00; carteiras independentes | `go test -tags integration -race -count=1 -run "TestSameBet50TimesInParallel\|TestTwoBetsOf80On100\|TestIndependentWalletsInParallel" -v ./internal/app/` |
+| Dois consumidores na mesma carteira, sem saldo negativo | `go test -tags integration -race -count=1 -run "TestTwoInstancesConsume" -v ./internal/inbound/` |
+| Falha antes do commit (retry) e depois do commit, antes de apagar a mensagem (reentrega) | `go test -tags integration -race -count=1 -run "TestFailureBeforeCommit\|TestDeleteFailureAfterCommit" -v ./internal/inbound/` |
+| Mesma operação por HTTP e por SQS | `go test -tags integration -race -count=1 -run "TestSameOperationViaHTTPAndSQS" -v ./internal/inbound/` |
+| Reinício: idempotência e referências pendentes preservadas | `go test -tags integration -race -count=1 -run "TestRestartKeeps" -v ./internal/inbound/` |
+| Referência chega depois / expira | `go test -tags integration -race -count=1 -run "TestPendingReference" -v ./internal/app/` |
+| Vários publishers, publisher que morre (lease), broker fora do ar | `go test -tags integration -race -count=1 -v ./internal/outbox/` |
+| Encerramento gracioso (Fx e consumidor) | `go test -tags integration -race -count=1 -run "TestLifecycle\|TestGracefulStop" -v ./internal/bootstrap/ ./internal/inbound/` |
+| DLQ, redrive e falha de exclusão no SQS real | `go test -tags localstack -race -count=1 -v ./internal/inbound/` |
+
+Para exercitar várias instâncias da API manualmente, deixe o Compose rodando e inicie outra instância no host, apontando para os mesmos PostgreSQL, Keycloak e LocalStack (variáveis de `.env.example`), com outra porta:
+
+```powershell
+$env:HTTP_ADDR = ':8082'
+go run .
+```
+
+As duas instâncias compartilham o banco e as filas: o lock da carteira, a idempotência, a inbox e a outbox garantem o resultado correto. Para simular indisponibilidade, use `docker compose stop postgres` (a API responde `503` com `Retry-After`, sem efeito financeiro) e `docker compose start postgres`; com `docker compose stop localstack`, a API continua operando e a outbox drena quando a fila volta.
 
 Os resultados efetivamente executados no ambiente de desenvolvimento estão em [`docs/VALIDATION.md`](docs/VALIDATION.md). A presença de um comando documentado não significa que ele passou em toda máquina ou em toda configuração.
 
