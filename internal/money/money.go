@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	isocurrency "golang.org/x/text/currency"
 )
 
 var (
@@ -31,6 +33,20 @@ func validCurrency(currency string) error {
 	if !currencyRe.MatchString(currency) {
 		return fmt.Errorf("%w: %q", ErrInvalidCurrency, currency)
 	}
+
+	// XXX representa ausência de moeda, não uma moeda para movimentação.
+	if currency == "XXX" {
+		return fmt.Errorf("%w: %q represents no currency", ErrInvalidCurrency, currency)
+	}
+
+	if _, err := isocurrency.ParseISO(currency); err != nil {
+		return fmt.Errorf(
+			"%w: %q is not a recognized ISO 4217 code",
+			ErrInvalidCurrency,
+			currency,
+		)
+	}
+
 	return nil
 }
 

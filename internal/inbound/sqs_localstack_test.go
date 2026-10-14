@@ -382,3 +382,106 @@ func TestSQSOutboxPublishesToRealEventsQueueWithDeduplication(t *testing.T) {
 		t.Errorf("a fila deveria descartar o reenvio com o mesmo eventId, mas entregou %d", len(again))
 	}
 }
+
+// lsDeleteFailsOnce simula uma falha de Delete depois do commit,
+// delegando Receive, Send e Release ao SQS real do LocalStack.
+type lsDeleteFailsOnce struct {
+	messaging.Queue
+	failed atomic.Bool
+}
+
+func (q *lsDeleteFailsOnce) Delete(ctx context.Context, receiptHandle string) error {
+	if q.failed.CompareAndSwap(false, true) {
+		return errors.New("falha simulada no Delete após o commit")
+	}
+	return q.Queue.Delete(ctx, receiptHandle)
+}
+
+func TestSQSDeleteFailureAfterCommitIsHarmless(t *testing.T) {
+	e := newLSEnv(t, 5, "100.00")
+
+	// A mensagem será processada pelo SQS real do LocalStack.
+	e.send(e.msg("BET", "25.00", 1), "")
+
+	// A primeira tentativa de exclusão falha; a seguinte usa o SQS real.
+	wrapped := &lsDeleteFailsOnce{Queue: e.cmds}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c := New(
+		wrapped,
+		e.dlq,
+		e.svc,
+		Config{
+			Workers:   1,
+			Wait:      time.Second,
+			BaseDelay: time.Second,
+			MaxDelay:  2 * time.Second,
+		},
+		e.obs,
+	)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.Run(ctx)
+	}()
+
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Error("consumidor não encerrou em 15 segundos")
+		}
+	})
+
+	// O SQS mantém a mensagem invisível até o VisibilityTimeout expirar.
+	// Na reentrega, a Inbox deve reconhecê-la como duplicata.
+	lsEventually(t, 60*time.Second, "reentrega reconhecida como duplicata", func() bool {
+		return wrapped.failed.Load() &&
+			e.obs.get("duplicate") == 1 &&
+			e.count(
+				`SELECT COUNT(*) FROM inbox_messages
+				 WHERE consumer_name='wager-commands'
+				   AND completed_at IS NOT NULL`,
+			) == 1 &&
+			e.balance() == "75.00"
+	})
+
+	// Confirma que a mensagem foi efetivamente removida do SQS após a reentrega.
+	lsDrained(t, e.cmds)
+
+	if got := e.balance(); got != "75.00" {
+		t.Errorf("saldo = %s, esperado 75.00", got)
+	}
+
+	if n := e.count(
+		`SELECT COUNT(*) FROM wager_transactions
+		 WHERE wallet_id=$1 AND kind='BET' AND status='PROCESSED'`,
+		e.walletID,
+	); n != 1 {
+		t.Errorf("apostas processadas = %d, esperado 1", n)
+	}
+
+	if n := e.count(
+		`SELECT COUNT(*) FROM wallet_ledger_entries
+		 WHERE wallet_id=$1 AND direction='DEBIT'`,
+		e.walletID,
+	); n != 1 {
+		t.Errorf("débitos no ledger = %d, esperado 1", n)
+	}
+
+	if e.obs.get("acked") != 1 || e.obs.get("duplicate") != 1 {
+		t.Errorf(
+			"acked=%d duplicate=%d, esperado 1 e 1",
+			e.obs.get("acked"),
+			e.obs.get("duplicate"),
+		)
+	}
+
+	if v, f, d, err := e.dlq.Approximate(context.Background()); err != nil {
+		t.Fatal(err)
+	} else if v+f+d != 0 {
+		t.Errorf("DLQ deveria estar vazia; visíveis=%d em voo=%d atrasadas=%d", v, f, d)
+	}
+}

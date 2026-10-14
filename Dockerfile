@@ -1,5 +1,5 @@
 # Estágio de Build
-FROM golang:1.27-alpine AS builder
+FROM golang:1.27.2-alpine3.24 AS builder
 
 WORKDIR /app
 
@@ -15,7 +15,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /wallet-service ./main.go
 
 # Estágio de Execução (Imagem final leve)
-FROM alpine:3.19
+FROM alpine:3.24
 
 WORKDIR /root/
 

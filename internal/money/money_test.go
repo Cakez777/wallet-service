@@ -44,7 +44,7 @@ func TestParseInvalid(t *testing.T) {
 }
 
 func TestInvalidCurrency(t *testing.T) {
-	for _, cur := range []string{"", "br", "BRLL", "123"} {
+	for _, cur := range []string{"", "br", "BRLL", "123", "ZZZ", "XXX"} {
 		if _, err := Parse("1.00", cur); !errors.Is(err, ErrInvalidCurrency) {
 			t.Errorf("moeda %q deveria dar ErrInvalidCurrency, veio %v", cur, err)
 		}
