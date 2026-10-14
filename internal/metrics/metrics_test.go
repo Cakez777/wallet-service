@@ -34,3 +34,22 @@ func TestExpositionContainsCountersGaugesAndHistogram(t *testing.T) {
 		}
 	}
 }
+
+func TestObserverAdaptersIncrementCounters(t *testing.T) {
+	r := New()
+	r.PendingRetry()
+	r.ReconciliationDivergence()
+	r.OutboxPublished()
+	r.OutboxPublished()
+	r.OutboxPublishFailed()
+	for name, want := range map[string]uint64{
+		"wallet_pending_retries_total":            1,
+		"wallet_reconciliation_divergences_total": 1,
+		"wallet_outbox_published_total":           2,
+		"wallet_outbox_publish_failures_total":    1,
+	} {
+		if got := r.Counter(name); got != want {
+			t.Errorf("%s = %d, esperado %d", name, got, want)
+		}
+	}
+}

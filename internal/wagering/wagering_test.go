@@ -60,6 +60,8 @@ func TestValidate(t *testing.T) {
 		"LOSS com valor":              cmd(t, KindLoss, "0.01"),
 		"BET zero":                    cmd(t, KindBet, "0.00"),
 		"WIN zero":                    cmd(t, KindWin, "0.00"),
+		"REFUND zero":                 cmd(t, KindRefund, "0.00"),
+		"ROLLBACK zero":               cmd(t, KindRollback, "0.00"),
 		"REFUND sem referência":       mutate(KindRefund, "1.00", func(c *Command) { c.ReferenceExternalTransactionID = "" }),
 		"ROLLBACK sem referência":     mutate(KindRollback, "1.00", func(c *Command) { c.ReferenceExternalTransactionID = "" }),
 		"BET com referência":          mutate(KindBet, "1.00", func(c *Command) { c.ReferenceExternalTransactionID = "x" }),

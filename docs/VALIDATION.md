@@ -74,6 +74,25 @@ Este arquivo registra as verificações executadas manualmente no ambiente de de
 - Uma consulta cruzando transações e ledger não encontrou transações processadas sem o lançamento esperado, movimentos associados a transações não processadas ou divergência entre os saldos finais registrados.
 - A Outbox tinha quatro eventos publicados em uma consulta inicial; após criar uma nova carteira e uma aposta de teste, a fila `wallet-events.fifo` passou de quatro para oito mensagens visíveis e quatro eventos novos estavam marcados como publicados no banco. A correspondência individual de cada mensagem da fila não foi inspecionada nesse passo específico.
 
+## Cobertura de testes
+
+Medida em 14 de outubro de 2026 em um ambiente Linux de desenvolvimento (PostgreSQL 16 local, sem Docker/LocalStack/Keycloak), com o perfil combinado de todos os pacotes:
+
+```powershell
+go test -tags integration -race -count=1 -coverpkg=./... -coverprofile=cover.out ./...
+go tool cover -func=cover.out
+go tool cover -html=cover.out -o cover.html
+```
+
+- Cobertura total combinada: **78,7 %** das instruções.
+- Os `0 %` restantes são, em geral, código exercitado apenas por outras tags: adaptador SQS (`messaging/sqs.go`, `bootstrap/messaging.go`, `outbox.Run`) é coberto pelos testes `-tags localstack`; `WithLeeway` e a verificação do Keycloak, por `-tags keycloak`; `main()` não tem teste.
+- Para o número completo na sua máquina, inclua as tags: `go test -tags "integration keycloak localstack" -race -coverpkg=./... -coverprofile=cover.out ./...` (com os serviços do Compose no ar).
+- Itens relevantes que estavam em 0 % e agora têm teste: `app.IsTransient` (classificação de falhas transitórias) e os contadores do observador de métricas.
+
+## Política do estado `FAILED`
+
+Decidida e documentada em `ARCHITECTURE.md` (seção 7.2), **sem implementação**: nenhum caminho atual o persiste, de propósito, para não marcar como terminal uma falha transitória ou de resultado incerto.
+
 ## Limitações que não foram validadas aqui
 
 - Não foi feito teste contra uma conta AWS real.
