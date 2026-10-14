@@ -303,11 +303,24 @@ func (c *Consumer) worker(ctx context.Context) {
 
 func (c *Consumer) backoff(receiveCount int) time.Duration {
 	d := c.cfg.BaseDelay
-	for i := 1; i < receiveCount && d < c.cfg.MaxDelay; i++ {
+	max := c.cfg.MaxDelay
+
+	if receiveCount <= 1 {
+		if d > max {
+			return max
+		}
+		return d
+	}
+
+	for i := 1; i < receiveCount && d < max; i++ {
+		if d > max/2 {
+			return max
+		}
 		d *= 2
 	}
-	if d > c.cfg.MaxDelay {
-		d = c.cfg.MaxDelay
+
+	if d > max {
+		return max
 	}
 	return d
 }

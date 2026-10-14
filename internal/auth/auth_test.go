@@ -36,7 +36,6 @@ func newIdP(t *testing.T, kids ...string) *idp {
 			http.Error(w, "down", http.StatusServiceUnavailable)
 			return
 		}
-		type jwk struct{ Kty, Kid, N, E string }
 		out := struct {
 			Keys []map[string]string `json:"keys"`
 		}{}
@@ -71,9 +70,15 @@ func (i *idp) verifier() *Verifier {
 func sign(t *testing.T, method jwt.SigningMethod, key any, kid string, mutate func(jwt.MapClaims)) string {
 	t.Helper()
 	c := jwt.MapClaims{
-		"iss": issuer, "sub": "svc-1", "azp": "provider-a",
-		"exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(),
-		"realm_access": map[string]any{"roles": []string{RoleProvider}},
+		"iss": issuer,
+		"sub": "svc-1",
+		"azp": "provider-a",
+		"aud": []string{ExpectedAudience},
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"iat": time.Now().Unix(),
+		"realm_access": map[string]any{
+			"roles": []string{RoleProvider},
+		},
 	}
 	if mutate != nil {
 		mutate(c)
@@ -89,11 +94,17 @@ func sign(t *testing.T, method jwt.SigningMethod, key any, kid string, mutate fu
 
 func TestVerifyValidToken(t *testing.T) {
 	i := newIdP(t, "k1")
-	p, err := i.verifier().Verify(context.Background(), sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", nil))
+	p, err := i.verifier().Verify(
+		context.Background(),
+		sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", nil),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.ProviderID() != "provider-a" || !p.HasRole(RoleProvider) || p.HasRole(RoleInternal) || p.Subject != "svc-1" {
+	if p.ProviderID() != "provider-a" ||
+		!p.HasRole(RoleProvider) ||
+		p.HasRole(RoleInternal) ||
+		p.Subject != "svc-1" {
 		t.Errorf("principal inesperado: %+v", p)
 	}
 }
@@ -101,31 +112,63 @@ func TestVerifyValidToken(t *testing.T) {
 func TestVerifyRejectsBadTokens(t *testing.T) {
 	i := newIdP(t, "k1")
 	v := i.verifier()
-	other, _ := rsa.GenerateKey(rand.Reader, 2048)
+	other, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
 	hs := sign(t, jwt.SigningMethodHS256, []byte("segredo"), "k1", nil)
 
 	cases := map[string]string{
-		"vazio":                     "",
-		"lixo":                      "nao.e.jwt",
-		"expirado":                  sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", func(c jwt.MapClaims) { c["exp"] = time.Now().Add(-time.Hour).Unix() }),
-		"sem exp":                   sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", func(c jwt.MapClaims) { delete(c, "exp") }),
-		"emissor errado":            sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", func(c jwt.MapClaims) { c["iss"] = "http://evil/realms/x" }),
+		"vazio": sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", func(c jwt.MapClaims) {
+			c["sub"] = ""
+		}),
+		"lixo": "nao.e.jwt",
+		"expirado": sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", func(c jwt.MapClaims) {
+			c["exp"] = time.Now().Add(-time.Hour).Unix()
+		}),
+		"sem exp": sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", func(c jwt.MapClaims) {
+			delete(c, "exp")
+		}),
+		"emissor errado": sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", func(c jwt.MapClaims) {
+			c["iss"] = "http://evil/realms/x"
+		}),
 		"assinatura de outra chave": sign(t, jwt.SigningMethodRS256, other, "k1", nil),
 		"HS256":                     hs,
-		"sem azp":                   sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", func(c jwt.MapClaims) { delete(c, "azp") }),
-		"kid desconhecido":          sign(t, jwt.SigningMethodRS256, i.keys["k1"], "kx", nil),
+		"sem azp": sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", func(c jwt.MapClaims) {
+			delete(c, "azp")
+		}),
+		"kid desconhecido": sign(t, jwt.SigningMethodRS256, i.keys["k1"], "kx", nil),
+		"sem aud": sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", func(c jwt.MapClaims) {
+			delete(c, "aud")
+		}),
+		"aud incorreta": sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", func(c jwt.MapClaims) {
+			c["aud"] = []string{"outro-servico"}
+		}),
+		"azp e client_id divergentes": sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", func(c jwt.MapClaims) {
+			c["client_id"] = "provider-b"
+		}),
+		"sem subject": sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", func(c jwt.MapClaims) {
+			delete(c, "sub")
+		}),
 	}
+
 	for name, tok := range cases {
-		if _, err := v.Verify(context.Background(), tok); !errors.Is(err, ErrUnauthenticated) {
-			t.Errorf("%s: esperado ErrUnauthenticated, veio %v", name, err)
-		}
+		t.Run(name, func(t *testing.T) {
+			if _, err := v.Verify(context.Background(), tok); !errors.Is(err, ErrUnauthenticated) {
+				t.Errorf("esperado ErrUnauthenticated, veio %v", err)
+			}
+		})
 	}
 }
 
 func TestVerifyIdPUnavailable(t *testing.T) {
 	i := newIdP(t, "k1")
 	i.down.Store(true)
-	_, err := i.verifier().Verify(context.Background(), sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", nil))
+
+	_, err := i.verifier().Verify(
+		context.Background(),
+		sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", nil),
+	)
 	if !errors.Is(err, ErrIdPUnavailable) {
 		t.Errorf("IdP fora deveria dar ErrIdPUnavailable, veio %v", err)
 	}
@@ -134,16 +177,30 @@ func TestVerifyIdPUnavailable(t *testing.T) {
 func TestVerifyKeyRotation(t *testing.T) {
 	i := newIdP(t, "k1")
 	v := i.verifier()
-	if _, err := v.Verify(context.Background(), sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", nil)); err != nil {
+
+	if _, err := v.Verify(
+		context.Background(),
+		sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", nil),
+	); err != nil {
 		t.Fatal(err)
 	}
+
 	i.addKey("k2") // o IdP publica uma chave nova
-	if _, err := v.Verify(context.Background(), sign(t, jwt.SigningMethodRS256, i.keys["k2"], "k2", nil)); err != nil {
+
+	if _, err := v.Verify(
+		context.Background(),
+		sign(t, jwt.SigningMethodRS256, i.keys["k2"], "k2", nil),
+	); err != nil {
 		t.Errorf("chave nova deveria ser descoberta por refresh: %v", err)
 	}
-	// IdP cai depois do cache aquecido: tokens com chave conhecida continuam válidos
+
+	// IdP cai depois do cache aquecido: tokens com chave conhecida continuam válidos.
 	i.down.Store(true)
-	if _, err := v.Verify(context.Background(), sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", nil)); err != nil {
+
+	if _, err := v.Verify(
+		context.Background(),
+		sign(t, jwt.SigningMethodRS256, i.keys["k1"], "k1", nil),
+	); err != nil {
 		t.Errorf("chave em cache deveria validar com o IdP fora: %v", err)
 	}
 }

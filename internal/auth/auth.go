@@ -1,8 +1,8 @@
 // Package auth valida tokens JWT emitidos por um IdP OAuth 2.0/OIDC (Keycloak).
 //
 // A validação é local: assinatura RS256 contra as chaves públicas do IdP (JWKS, com cache e
-// refresh quando aparece um kid novo), emissor (iss) e expiração (exp). Não há emissão de
-// tokens nem cadastro de senhas aqui.
+// refresh quando aparece um kid novo), emissor (iss), audiência (aud) e expiração (exp).
+// Não há emissão de tokens nem cadastro de senhas aqui.
 package auth
 
 import (
@@ -20,21 +20,24 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// Papéis (realm roles do Keycloak) que o serviço reconhece.
+// Papéis e audiência que o serviço reconhece.
 const (
-	RoleProvider = "wallet-provider" // provedor de jogos: envia e consulta as próprias transações
-	RoleInternal = "wallet-internal" // serviço interno: operações de carteira
+	RoleProvider     = "wallet-provider"
+	RoleInternal     = "wallet-internal"
+	ExpectedAudience = "wallet-service"
 )
 
 var (
-	// ErrUnauthenticated: token ausente, malformado, expirado, de outro emissor ou mal assinado.
+	// ErrUnauthenticated: token ausente, malformado, expirado, de outro emissor,
+	// com audiência inválida ou mal assinado.
 	ErrUnauthenticated = errors.New("unauthenticated")
+
 	// ErrIdPUnavailable: não foi possível obter as chaves do IdP (falha transitória).
 	ErrIdPUnavailable = errors.New("identity provider unavailable")
 )
 
-// Principal é a identidade autenticada. Para client_credentials, ClientID (claim azp)
-// identifica o chamador e, para provedores, é o providerId autorizado.
+// Principal é a identidade autenticada. Para client_credentials, ClientID identifica
+// o chamador e, para provedores, é o providerId autorizado.
 type Principal struct {
 	Subject  string
 	ClientID string
@@ -51,8 +54,10 @@ func (p Principal) HasRole(role string) bool {
 	return false
 }
 
-// ProviderID é o provedor autorizado para este principal (o client_id do IdP).
-func (p Principal) ProviderID() string { return p.ClientID }
+// ProviderID é o provedor autorizado para este principal.
+func (p Principal) ProviderID() string {
+	return p.ClientID
+}
 
 type claims struct {
 	jwt.RegisteredClaims
@@ -75,45 +80,85 @@ type Verifier struct {
 	lastFetch time.Time
 }
 
-// NewVerifier cria o verificador. issuer deve ser exatamente o valor do claim iss.
+// NewVerifier cria o verificador.
+//
+// issuer deve corresponder exatamente ao claim iss.
+// Os tokens também precisam conter ExpectedAudience no claim aud.
 func NewVerifier(issuer, jwksURL string) *Verifier {
 	return &Verifier{
-		issuer: issuer, jwksURL: jwksURL,
+		issuer:     issuer,
+		jwksURL:    jwksURL,
 		client:     &http.Client{Timeout: 5 * time.Second},
 		minRefresh: 10 * time.Second,
 		keys:       map[string]*rsa.PublicKey{},
 	}
 }
 
-// Verify valida o token e devolve a identidade.
+// Verify valida o token e devolve a identidade autenticada.
 func (v *Verifier) Verify(ctx context.Context, raw string) (Principal, error) {
 	var c claims
-	tok, err := jwt.ParseWithClaims(raw, &c, func(t *jwt.Token) (any, error) {
-		kid, _ := t.Header["kid"].(string)
-		return v.key(ctx, kid)
-	},
+
+	tok, err := jwt.ParseWithClaims(
+		raw,
+		&c,
+		func(t *jwt.Token) (any, error) {
+			kid, _ := t.Header["kid"].(string)
+			if kid == "" {
+				return nil, fmt.Errorf("missing signing key ID")
+			}
+			return v.key(ctx, kid)
+		},
 		jwt.WithValidMethods([]string{"RS256"}),
 		jwt.WithIssuer(v.issuer),
+		jwt.WithAudience(ExpectedAudience),
 		jwt.WithExpirationRequired(),
 		jwt.WithLeeway(30*time.Second),
 	)
+
 	if err != nil {
 		if errors.Is(err, ErrIdPUnavailable) {
 			return Principal{}, err
 		}
 		return Principal{}, fmt.Errorf("%w: %v", ErrUnauthenticated, err)
 	}
+
 	if !tok.Valid {
 		return Principal{}, ErrUnauthenticated
 	}
+
+	// Não aceita tokens sem uma identidade de cliente.
+	// Se os dois claims existirem, precisam concordar.
+	if c.Azp != "" && c.ClientID != "" && c.Azp != c.ClientID {
+		return Principal{}, fmt.Errorf(
+			"%w: azp and client_id do not match",
+			ErrUnauthenticated,
+		)
+	}
+
 	client := c.Azp
 	if client == "" {
 		client = c.ClientID
 	}
+
 	if client == "" {
-		return Principal{}, fmt.Errorf("%w: token without azp/client_id", ErrUnauthenticated)
+		return Principal{}, fmt.Errorf(
+			"%w: token without azp/client_id",
+			ErrUnauthenticated,
+		)
 	}
-	return Principal{Subject: c.Subject, ClientID: client, Roles: c.RealmAccess.Roles}, nil
+
+	if c.Subject == "" {
+		return Principal{}, fmt.Errorf(
+			"%w: token without subject",
+			ErrUnauthenticated,
+		)
+	}
+
+	return Principal{
+		Subject:  c.Subject,
+		ClientID: client,
+		Roles:    c.RealmAccess.Roles,
+	}, nil
 }
 
 func (v *Verifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) {
@@ -122,21 +167,28 @@ func (v *Verifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) 
 	empty := len(v.keys) == 0
 	last := v.lastFetch
 	v.mu.RUnlock()
+
 	if ok {
 		return k, nil
 	}
-	// kid desconhecido: atualiza o JWKS, no máximo uma vez por minRefresh (a menos que o cache esteja vazio).
+
+	// Um kid desconhecido provoca atualização do JWKS, respeitando o intervalo
+	// mínimo entre consultas quando o cache já contém chaves.
 	if !empty && time.Since(last) < v.minRefresh {
 		return nil, fmt.Errorf("unknown signing key %q", kid)
 	}
+
 	if err := v.refresh(ctx); err != nil {
 		return nil, err
 	}
+
 	v.mu.RLock()
 	defer v.mu.RUnlock()
+
 	if k, ok := v.keys[kid]; ok {
 		return k, nil
 	}
+
 	return nil, fmt.Errorf("unknown signing key %q", kid)
 }
 
@@ -154,35 +206,71 @@ func (v *Verifier) refresh(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrIdPUnavailable, err)
 	}
+
 	resp, err := v.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrIdPUnavailable, err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%w: jwks returned %d", ErrIdPUnavailable, resp.StatusCode)
+		return fmt.Errorf(
+			"%w: jwks returned %d",
+			ErrIdPUnavailable,
+			resp.StatusCode,
+		)
 	}
+
 	var set jwks
-	if err := json.NewDecoder(http.MaxBytesReader(nil, resp.Body, 1<<20)).Decode(&set); err != nil {
+	decoder := json.NewDecoder(http.MaxBytesReader(nil, resp.Body, 1<<20))
+	if err := decoder.Decode(&set); err != nil {
 		return fmt.Errorf("%w: invalid jwks: %v", ErrIdPUnavailable, err)
 	}
-	keys := map[string]*rsa.PublicKey{}
+
+	keys := make(map[string]*rsa.PublicKey)
+
 	for _, k := range set.Keys {
-		if k.Kty != "RSA" {
+		if k.Kty != "RSA" || k.Kid == "" || k.N == "" || k.E == "" {
 			continue
 		}
-		n, err1 := base64.RawURLEncoding.DecodeString(k.N)
-		e, err2 := base64.RawURLEncoding.DecodeString(k.E)
-		if err1 != nil || err2 != nil {
+
+		n, errN := base64.RawURLEncoding.DecodeString(k.N)
+		e, errE := base64.RawURLEncoding.DecodeString(k.E)
+		if errN != nil || errE != nil {
 			continue
 		}
-		keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: int(new(big.Int).SetBytes(e).Int64())}
+
+		modulus := new(big.Int).SetBytes(n)
+		exponentBig := new(big.Int).SetBytes(e)
+
+		// Rejeita parâmetros RSA inválidos ou chaves menores que 2048 bits.
+		if modulus.Sign() <= 0 || modulus.BitLen() < 2048 {
+			continue
+		}
+
+		if !exponentBig.IsInt64() {
+			continue
+		}
+
+		exponent64 := exponentBig.Int64()
+		if exponent64 < 3 || exponent64%2 == 0 || exponent64 > int64(^uint(0)>>1) {
+			continue
+		}
+
+		keys[k.Kid] = &rsa.PublicKey{
+			N: modulus,
+			E: int(exponent64),
+		}
 	}
+
 	if len(keys) == 0 {
 		return fmt.Errorf("%w: jwks has no usable RSA keys", ErrIdPUnavailable)
 	}
+
 	v.mu.Lock()
-	v.keys, v.lastFetch = keys, time.Now()
+	v.keys = keys
+	v.lastFetch = time.Now()
 	v.mu.Unlock()
+
 	return nil
 }

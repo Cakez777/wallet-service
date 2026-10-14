@@ -5,30 +5,117 @@
   "accessTokenLifespan": 300,
   "roles": {
     "realm": [
-      { "name": "wallet-provider", "description": "Provedor de jogos: envia e consulta as próprias transações" },
-      { "name": "wallet-internal", "description": "Serviço interno: operações de carteira" }
+      {
+        "name": "wallet-provider",
+        "description": "Provedor de jogos: envia e consulta as próprias transações"
+      },
+      {
+        "name": "wallet-internal",
+        "description": "Serviço interno: operações de carteira"
+      }
     ]
   },
   "clients": [
     {
-      "clientId": "provider-a", "enabled": true, "protocol": "openid-connect",
-      "publicClient": false, "clientAuthenticatorType": "client-secret", "secret": "provider-a-secret",
-      "serviceAccountsEnabled": true, "standardFlowEnabled": false, "directAccessGrantsEnabled": false
+      "clientId": "provider-a",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "provider-a-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "protocolMappers": [
+        {
+          "name": "wallet-service-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "wallet-service",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
     },
     {
-      "clientId": "provider-b", "enabled": true, "protocol": "openid-connect",
-      "publicClient": false, "clientAuthenticatorType": "client-secret", "secret": "provider-b-secret",
-      "serviceAccountsEnabled": true, "standardFlowEnabled": false, "directAccessGrantsEnabled": false
+      "clientId": "provider-b",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "provider-b-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "protocolMappers": [
+        {
+          "name": "wallet-service-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "wallet-service",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
     },
     {
-      "clientId": "wallet-internal-service", "enabled": true, "protocol": "openid-connect",
-      "publicClient": false, "clientAuthenticatorType": "client-secret", "secret": "internal-secret",
-      "serviceAccountsEnabled": true, "standardFlowEnabled": false, "directAccessGrantsEnabled": false
+      "clientId": "wallet-internal-service",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "internal-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "protocolMappers": [
+        {
+          "name": "wallet-service-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "wallet-service",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
     }
   ],
   "users": [
-    { "username": "service-account-provider-a", "enabled": true, "serviceAccountClientId": "provider-a", "realmRoles": ["wallet-provider"] },
-    { "username": "service-account-provider-b", "enabled": true, "serviceAccountClientId": "provider-b", "realmRoles": ["wallet-provider"] },
-    { "username": "service-account-wallet-internal-service", "enabled": true, "serviceAccountClientId": "wallet-internal-service", "realmRoles": ["wallet-internal"] }
+    {
+      "username": "service-account-provider-a",
+      "enabled": true,
+      "serviceAccountClientId": "provider-a",
+      "realmRoles": [
+        "wallet-provider"
+      ]
+    },
+    {
+      "username": "service-account-provider-b",
+      "enabled": true,
+      "serviceAccountClientId": "provider-b",
+      "realmRoles": [
+        "wallet-provider"
+      ]
+    },
+    {
+      "username": "service-account-wallet-internal-service",
+      "enabled": true,
+      "serviceAccountClientId": "wallet-internal-service",
+      "realmRoles": [
+        "wallet-internal"
+      ]
+    }
   ]
 }

@@ -134,11 +134,24 @@ func (p *Publisher) claim(ctx context.Context) ([]claimed, error) {
 
 func (p *Publisher) backoff(attempts int) time.Duration {
 	d := p.cfg.BaseDelay
-	for i := 0; i < attempts && d < p.cfg.MaxDelay; i++ {
+	max := p.cfg.MaxDelay
+
+	if attempts <= 0 {
+		if d > max {
+			return max
+		}
+		return d
+	}
+
+	for i := 0; i < attempts && d < max; i++ {
+		if d > max/2 {
+			return max
+		}
 		d *= 2
 	}
-	if d > p.cfg.MaxDelay {
-		d = p.cfg.MaxDelay
+
+	if d > max {
+		return max
 	}
 	return d
 }
@@ -213,10 +226,19 @@ func (p *Publisher) release(evs []claimed) {
 // Run publica continuamente até ctx ser cancelado. Esvazia a outbox sem pausa e, quando não
 // há nada elegível, espera interval.
 func (p *Publisher) Run(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+
 	t := time.NewTicker(interval)
 	defer t.Stop()
+
 	for {
 		for {
+			if ctx.Err() != nil {
+				return
+			}
+
 			n, err := p.PublishBatch(ctx)
 			if err != nil {
 				if ctx.Err() == nil {
@@ -224,10 +246,12 @@ func (p *Publisher) Run(ctx context.Context, interval time.Duration) {
 				}
 				break
 			}
+
 			if n == 0 {
 				break
 			}
 		}
+
 		select {
 		case <-ctx.Done():
 			return

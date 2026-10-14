@@ -205,11 +205,25 @@ func (s *Service) processOnce(ctx context.Context, cmd wagering.Command, h Hooks
 
 func (s *Service) delay(attempt int) time.Duration {
 	d := s.cfg.PendingBaseDelay
-	for i := 1; i < attempt && d < s.cfg.PendingMaxDelay; i++ {
+	max := s.cfg.PendingMaxDelay
+
+	if attempt <= 1 {
+		if d > max {
+			return max
+		}
+		return d
+	}
+
+	for i := 1; i < attempt && d < max; i++ {
+		// Evita overflow ao dobrar a duração.
+		if d > max/2 {
+			return max
+		}
 		d *= 2
 	}
-	if d > s.cfg.PendingMaxDelay {
-		d = s.cfg.PendingMaxDelay
+
+	if d > max {
+		return max
 	}
 	return d
 }
